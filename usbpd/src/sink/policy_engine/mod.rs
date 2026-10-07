@@ -17,7 +17,7 @@ use crate::protocol_layer::message::header::{
 };
 use crate::protocol_layer::message::{Payload, extended};
 use crate::protocol_layer::{ProtocolError, RxError, SinkProtocolLayer, TxError};
-use crate::sink::device_policy_manager::Event;
+use crate::sink::device_policy_manager::{Event, PartnerQuery, PpsStatusOutcome, QueryOutcome};
 use crate::timers::{Timer, TimerType};
 use crate::{DataRole, PowerRole, units};
 
@@ -57,6 +57,24 @@ enum State {
     /// which requires running SinkRequestTimer before allowing re-request.
     Ready(request::PowerSource, bool),
     SendNotSupported(request::PowerSource),
+    /// PE_DRS_UFP_DFP_Reject_Swap or PE_VCS_Reject_VCONN_Swap: Reject a DR_Swap
+    /// (UFP-only Sink) or a VCONN_Swap (this Sink is not the VCONN Source in Ready).
+    RejectSwap(request::PowerSource),
+    /// PE_BIST_Test_Mode (section 9.2.26.4.2.1): only GoodCRC until Hard Reset.
+    BistTestData,
+    /// PE_BIST_Carrier_Mode (section 9.2.26.4.1.1).
+    BistCarrierMode(request::PowerSource),
+    /// A Chunk of a multi-Chunk Message arrived without a Chunking layer.
+    ChunkReceived(request::PowerSource),
+    GiveRevision(request::PowerSource),
+    GiveSinkCapExtended(request::PowerSource, [u8; 24]),
+    GiveStatus(request::PowerSource, [u8; 7]),
+    SendSinkAlert(request::PowerSource, u32),
+    WaitForGetStatus(request::PowerSource),
+    GetPpsStatus(request::PowerSource),
+    /// PE_SNK_Get_Source_Cap_Ext, PE_Get_Revision or PE_Get_Manufacturer_Info.
+    Query(request::PowerSource, PartnerQuery),
+    DiscoverCable(request::PowerSource),
     SendSoftReset,
     SoftReset,
     HardReset,
@@ -91,6 +109,12 @@ pub struct Sink<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> {
     /// Source_Capabilities message that was not requested via Get_Source_Cap
     /// shall trigger a Hard Reset.
     get_source_cap_pending: bool,
+    established_request: Option<request::PowerSource>,
+    wait_request: Option<request::PowerSource>,
+    /// From a Soft Reset (sent or accepted) until the renegotiated Request ends
+    /// (PS_RDY, Reject or Wait). A further Protocol Error then means the Soft
+    /// Reset did not correct the error: Hard Reset (section 7.1.1).
+    recovering: bool,
 
     _timer: PhantomData<TIMER>,
 }
@@ -115,7 +139,9 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
     /// Create a fresh protocol layer with initial state.
     fn new_protocol_layer(driver: DRIVER) -> SinkProtocolLayer<DRIVER, TIMER> {
         let header = Header::new_template(DataRole::Ufp, PowerRole::Sink, SpecificationRevision::R3_X);
-        SinkProtocolLayer::new(driver, header)
+        let mut protocol_layer = SinkProtocolLayer::new(driver, header);
+        protocol_layer.set_chunking(DPM::CHUNKING);
+        protocol_layer
     }
 
     /// Create a new sink policy engine with a given `driver`.
@@ -129,6 +155,9 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
             source_capabilities: None,
             mode: Mode::Spr,
             get_source_cap_pending: false,
+            established_request: None,
+            wait_request: None,
+            recovering: false,
             _timer: PhantomData,
         }
     }
@@ -141,16 +170,61 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
     /// Run a single step in the policy engine state machine.
     async fn run_step(&mut self) -> Result<(), Error> {
         let result = self.update_state().await;
+        self.note_recovery();
         if result.is_ok() {
             return Ok(());
         }
 
         if let Err(Error::Protocol(protocol_error)) = result {
+            // Sections 7.2/7.3: an unsent Sink-initiated Request leaves the
+            // Explicit Contract unchanged; return to Ready, where a Message that
+            // caused the discard is received next.
+            if let (
+                State::SelectCapability(requested),
+                ProtocolError::TransmitDeferred,
+                Contract::Explicit,
+                Some(established),
+            ) = (&self.state, &protocol_error, self.contract, self.established_request)
+            {
+                let requested = *requested;
+                self.device_policy_manager.request_deferred(&requested).await;
+                self.state = State::Ready(established, false);
+                return Ok(());
+            }
+            // The same for an unsent Get_PPS_Status (PE_SNK_Get_PPS_Status).
+            if let (State::GetPpsStatus(power_source), ProtocolError::TransmitDeferred) = (&self.state, &protocol_error)
+            {
+                let power_source = *power_source;
+                self.device_policy_manager.pps_status(PpsStatusOutcome::Deferred).await;
+                self.state = State::Ready(power_source, false);
+                return Ok(());
+            }
+            // A proven unsent Alert keeps its event bits; no automatic retry.
+            if let (State::SendSinkAlert(power_source, ado), ProtocolError::TransmitDeferred) =
+                (&self.state, &protocol_error)
+            {
+                let (power_source, ado) = (*power_source, *ado);
+                self.device_policy_manager.sink_alert_not_sent(ado).await;
+                self.state = State::Ready(power_source, false);
+                return Ok(());
+            }
+            // The same for an unsent information request.
+            if let (State::Query(power_source, query), ProtocolError::TransmitDeferred) = (&self.state, &protocol_error)
+            {
+                let (power_source, query) = (*power_source, *query);
+                self.device_policy_manager.query(query, QueryOutcome::Deferred).await;
+                self.state = State::Ready(power_source, false);
+                return Ok(());
+            }
             let new_state = match (&self.mode, &self.state, protocol_error) {
                 // Handle when hard reset is signaled by the driver itself.
                 (_, _, ProtocolError::RxError(RxError::HardReset) | ProtocolError::TxError(TxError::HardReset)) => {
                     Some(State::TransitionToDefault)
                 }
+
+                // Section 6.4.3.1: in BIST Test Data Mode nothing but Hard Reset is
+                // acted on, including a Soft_Reset or a malformed Message.
+                (_, State::BistTestData, _) => Some(State::BistTestData),
 
                 // Handle when soft reset is signaled by the driver itself.
                 (_, _, ProtocolError::RxError(RxError::SoftReset)) => Some(State::SoftReset),
@@ -158,6 +232,21 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                 // Per spec 6.3.13: If the Soft_Reset Message fails, a Hard Reset shall be initiated.
                 // This handles the case where we're trying to send/receive a soft reset and it fails.
                 (_, State::SoftReset | State::SendSoftReset, ProtocolError::TransmitRetriesExceeded(_)) => {
+                    Some(State::HardReset)
+                }
+
+                // Sections 7.7, 9.2.5.2.1: in PE_SNK_Send_Soft_Reset, a SenderResponseTimer
+                // timeout or any Protocol Error (no Accept) leads to Hard Reset, never
+                // another Soft_Reset. A received Soft_Reset is handled above.
+                (_, State::SendSoftReset, _) => Some(State::HardReset),
+
+                // Section 7.1.1: while recovering, any further Protocol Error while
+                // waiting for capabilities or for the Request's answer means the
+                // Soft Reset did not correct the error: Hard Reset, never a second
+                // Soft_Reset. (Timeouts: arms below.)
+                (_, State::WaitForCapabilities | State::SelectCapability(_), ref error)
+                    if self.recovering && !matches!(error, ProtocolError::RxError(RxError::ReceiveTimeout)) =>
+                {
                     Some(State::HardReset)
                 }
 
@@ -176,6 +265,15 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                 // shall trigger a Hard Reset, not a Soft Reset.
                 (_, State::TransitionSink(_), _) => Some(State::HardReset),
 
+                // Table 7.1: during an AMS with power not transitioning, an Unsupported or
+                // Unrecognized Message (or a Chunk this port cannot assemble) is also a
+                // Protocol Error answered with Soft_Reset, not a repeat of the AMS.
+                (
+                    _,
+                    State::SelectCapability(_) | State::GetPpsStatus(_) | State::Query(..) | State::WaitForGetStatus(_),
+                    ProtocolError::RxError(RxError::UnsupportedMessage | RxError::ChunkingNotSupported),
+                ) => Some(State::SendSoftReset),
+
                 // Unexpected messages indicate a protocol error and demand a soft reset.
                 // Per spec 6.8.1 Table 6.72 (for non-power-transitioning states).
                 // Note: This must come AFTER TransitionSink check above.
@@ -184,6 +282,11 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                 // Per spec Table 6.72: Unsupported messages in Ready state get Not_Supported response.
                 (_, State::Ready(power_source, _), ProtocolError::RxError(RxError::UnsupportedMessage)) => {
                     Some(State::SendNotSupported(*power_source))
+                }
+
+                // Section 9.2.7: a Chunk of a multi-Chunk Message without a Chunking layer.
+                (_, State::Ready(power_source, _), ProtocolError::RxError(RxError::ChunkingNotSupported)) => {
+                    Some(State::ChunkReceived(*power_source))
                 }
 
                 // Per spec 6.6.9.1: Transmission failure (no GoodCRC after retries) triggers Soft Reset.
@@ -202,11 +305,21 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
             if let Some(state) = new_state {
                 self.state = state
             }
+            self.note_recovery();
 
             Ok(())
         } else {
             error!("Unrecoverable result {:?} in sink state transition", result);
             result
+        }
+    }
+
+    /// Track `recovering` from the state just entered.
+    fn note_recovery(&mut self) {
+        match self.state {
+            State::SoftReset | State::SendSoftReset => self.recovering = true,
+            State::Ready(..) | State::Startup | State::TransitionToDefault => self.recovering = false,
+            _ => {}
         }
     }
 
@@ -247,6 +360,8 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
         let new_state = match &self.state {
             State::Startup => {
                 self.contract = Default::default();
+                self.established_request = None;
+                self.wait_request = None;
                 self.protocol_layer.reset();
                 self.mode = Mode::Spr;
 
@@ -295,16 +410,30 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                     unreachable!()
                 };
 
+                let retry_wait = if matches!(
+                    control_message_type,
+                    ControlMessageType::Reject | ControlMessageType::Wait
+                ) {
+                    // The renegotiation ended: a Soft Reset corrected the error.
+                    self.recovering = false;
+                    self.device_policy_manager
+                        .request_declined(power_source, control_message_type)
+                        .await
+                } else {
+                    false
+                };
                 match (self.contract, control_message_type) {
                     (_, ControlMessageType::Accept) => State::TransitionSink(*power_source),
                     (Contract::Safe5V, ControlMessageType::Wait | ControlMessageType::Reject) => {
                         State::WaitForCapabilities
                     }
-                    (Contract::Explicit, ControlMessageType::Reject) => State::Ready(*power_source, false),
+                    (Contract::Explicit, ControlMessageType::Reject) => {
+                        self.wait_request = None;
+                        State::Ready(self.established_request.expect("explicit contract"), false)
+                    }
                     (Contract::Explicit, ControlMessageType::Wait) => {
-                        // Per spec 8.3.3.3.7: On entry to Ready as result of Wait,
-                        // initialize and run SinkRequestTimer.
-                        State::Ready(*power_source, true)
+                        self.wait_request = retry_wait.then_some(*power_source);
+                        State::Ready(self.established_request.expect("explicit contract"), retry_wait)
                     }
                     _ => unreachable!(),
                 }
@@ -322,6 +451,8 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
 
                 self.contract = Contract::TransitionToExplicit;
                 self.device_policy_manager.transition_power(power_source).await;
+                self.established_request = Some(*power_source);
+                self.wait_request = None;
                 State::Ready(*power_source, false)
             }
             State::Ready(power_source, after_wait) => {
@@ -368,6 +499,10 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                     // A message was received.
                     Either3::First(message) => {
                         let message = message?;
+                        let pd3 = matches!(
+                            self.protocol_layer.header().spec_revision(),
+                            Ok(SpecificationRevision::R3_X)
+                        );
 
                         match message.header.message_type() {
                             MessageType::Data(DataMessageType::SourceCapabilities) => {
@@ -385,7 +520,7 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                                     State::EvaluateCapabilities(capabilities)
                                 }
                             }
-                            MessageType::Extended(ExtendedMessageType::EprSourceCapabilities) => {
+                            MessageType::Extended(ExtendedMessageType::EprSourceCapabilities) if DPM::EPR => {
                                 if let Some(Payload::Extended(extended::Extended::EprSourceCapabilities(pdos))) =
                                     message.payload
                                 {
@@ -403,16 +538,90 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                                     unreachable!()
                                 }
                             }
-                            MessageType::Data(DataMessageType::EprMode) => {
+                            // An SPR-only contract has no EPR Mode to exit; unsupported below.
+                            MessageType::Data(DataMessageType::EprMode) if self.mode == Mode::Epr => {
                                 // Handle source exit notification.
                                 State::EprExitReceived(*power_source)
+                            }
+                            // PE_SNK_Source_Alert_Received: inform the DPM, no response.
+                            MessageType::Data(DataMessageType::Alert) if pd3 => {
+                                if let Some(Payload::Data(Data::Alert(ado))) = message.payload {
+                                    self.device_policy_manager.alert(ado).await;
+                                }
+                                State::Ready(*power_source, *after_wait)
+                            }
+                            // Section 9.2.26.4: BIST Test Data and Carrier Mode only at vSafe5V
+                            // (the vSafe5V Fixed PDO is always object 1). Other BIST modes, or
+                            // BIST above vSafe5V, receive GoodCRC only.
+                            MessageType::Data(DataMessageType::Bist) => match message.payload {
+                                Some(Payload::Data(Data::Bist(bdo))) if power_source.object_position() == 1 => {
+                                    match bdo >> 28 {
+                                        0b1000 => State::BistTestData,
+                                        0b0101 => State::BistCarrierMode(*power_source),
+                                        _ => State::Ready(*power_source, *after_wait),
+                                    }
+                                }
+                                _ => State::Ready(*power_source, *after_wait),
+                            },
+                            // PD2 V1.3 section 6.4.4: a port not supporting VDMs Ignores them.
+                            // PD3 section 8.4/8.5 answers Not_Supported below.
+                            MessageType::Data(DataMessageType::VendorDefined) if !pd3 => {
+                                State::Ready(*power_source, *after_wait)
+                            }
+                            // PE_SNK_Not_Supported_Received: inform the DPM, no response.
+                            MessageType::Control(ControlMessageType::NotSupported) if pd3 => {
+                                State::Ready(*power_source, *after_wait)
+                            }
+                            // Section 7.25: Get_Revision responder support is Required.
+                            MessageType::Control(ControlMessageType::GetRevision) if pd3 => {
+                                State::GiveRevision(*power_source)
+                            }
+                            // Table 7.4: Get_Sink_Cap_Extended responder support is Required.
+                            MessageType::Control(ControlMessageType::GetSinkCapExtended) if pd3 => {
+                                match self.device_policy_manager.sink_capabilities_extended() {
+                                    Some(block) => State::GiveSinkCapExtended(*power_source, block),
+                                    None => State::SendNotSupported(*power_source),
+                                }
+                            }
+                            MessageType::Control(ControlMessageType::GetStatus) if pd3 => {
+                                match self.device_policy_manager.status() {
+                                    Some(block) => State::GiveStatus(*power_source, block),
+                                    None => State::SendNotSupported(*power_source),
+                                }
+                            }
+                            // PD2 Ping needs GoodCRC only, not Reject/Not_Supported.
+                            MessageType::Control(ControlMessageType::Ping)
+                                if matches!(
+                                    self.protocol_layer.header().spec_revision(),
+                                    Ok(SpecificationRevision::R1_0 | SpecificationRevision::R2_0)
+                                ) =>
+                            {
+                                State::Ready(*power_source, *after_wait)
                             }
                             // Per spec 8.3.3.3.7: Get_Sink_Cap → GiveSinkCap (send Sink_Capabilities)
                             MessageType::Control(ControlMessageType::GetSinkCap) => {
                                 State::GiveSinkCap(Mode::Spr, *power_source)
                             }
+                            // Section 7.12.1: the recipient of DR_Swap Shall answer Accept,
+                            // Wait or Reject (PD2 V1.3 section 6.3.9 likewise). This Sink does
+                            // not change Data Role and enters no SOP Modal Operation.
+                            MessageType::Control(ControlMessageType::DrSwap) => State::RejectSwap(*power_source),
+                            // Section 7.13: a recipient that is not presently the VCONN
+                            // Source answers Reject (PD2 V1.3 section 6.3.11 likewise).
+                            // Cable inspection switches VCONN off before Ready resumes.
+                            // FIXME: a Sink that stays VCONN Source Shall Not Reject; it
+                            // needs the Accept path.
+                            MessageType::Control(ControlMessageType::VconnSwap) => State::RejectSwap(*power_source),
+                            // Table 7.1: a Recognized, Supported but Unexpected Message in
+                            // PE_SNK_Ready is a Protocol Error answered with Soft_Reset.
+                            MessageType::Control(
+                                ControlMessageType::Accept
+                                | ControlMessageType::Reject
+                                | ControlMessageType::PsRdy
+                                | ControlMessageType::Wait,
+                            ) => State::SendSoftReset,
                             // Per spec 8.3.3.3.7: EPR_Get_Sink_Cap → GiveSinkCap (send EPR_Sink_Capabilities)
-                            MessageType::Extended(ExtendedMessageType::ExtendedControl) => {
+                            MessageType::Extended(ExtendedMessageType::ExtendedControl) if DPM::EPR => {
                                 if let Some(Payload::Extended(extended::Extended::ExtendedControl(ctrl))) =
                                     &message.payload
                                 {
@@ -435,6 +644,49 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                         Event::EnterEprMode(pdp) => State::EprModeEntry(*power_source, pdp),
                         Event::ExitEprMode => State::EprSendExit,
                         Event::RequestPower(power_source) => State::SelectCapability(power_source),
+                        Event::DiscoverCable => State::DiscoverCable(*power_source),
+                        // Get_PPS_Status exists only in PD3 and only for a PPS contract.
+                        Event::GetPpsStatus => {
+                            let pd3 = matches!(
+                                self.protocol_layer.header().spec_revision(),
+                                Ok(SpecificationRevision::R3_X)
+                            );
+                            if pd3 && matches!(power_source, PowerSource::Pps(_)) {
+                                State::GetPpsStatus(*power_source)
+                            } else {
+                                self.device_policy_manager.pps_status(PpsStatusOutcome::NotSent).await;
+                                State::Ready(*power_source, false)
+                            }
+                        }
+                        // The information requests exist only in PD3 (Table 6.5).
+                        Event::Query(query) => {
+                            let pd3 = matches!(
+                                self.protocol_layer.header().spec_revision(),
+                                Ok(SpecificationRevision::R3_X)
+                            );
+                            if pd3 {
+                                State::Query(*power_source, query)
+                            } else {
+                                self.device_policy_manager.query(query, QueryOutcome::NotSent).await;
+                                State::Ready(*power_source, false)
+                            }
+                        }
+                        Event::SendSinkAlert(ado) => {
+                            let pd3 = matches!(
+                                self.protocol_layer.header().spec_revision(),
+                                Ok(SpecificationRevision::R3_X)
+                            );
+                            if pd3
+                                && ado != 0
+                                && ado & !0x7800_0000 == 0
+                                && self.device_policy_manager.status().is_some()
+                            {
+                                State::SendSinkAlert(*power_source, ado)
+                            } else {
+                                self.device_policy_manager.sink_alert_not_sent(ado).await;
+                                State::Ready(*power_source, false)
+                            }
+                        }
                         Event::None => State::Ready(*power_source, false),
                     },
                     // Timer timeout handling
@@ -444,15 +696,209 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                         // EPR keep-alive timeout
                         Either3::Second(_) => State::EprKeepAlive(*power_source),
                         // SinkRequest timeout -> re-request power after Wait response
-                        Either3::Third(_) => State::SelectCapability(*power_source),
+                        Either3::Third(_) => State::SelectCapability(self.wait_request.take().expect("Wait retry")),
                     },
                 }
             }
-            State::SendNotSupported(power_source) => {
+            State::DiscoverCable(power_source) => {
+                let report = self.protocol_layer.discover_cable().await?;
+                self.device_policy_manager.cable_report(report).await;
+                State::Ready(*power_source, false)
+            }
+            State::ChunkReceived(power_source) => {
+                // PE_SNK_Chunk_Received: Not_Supported only after tChunkingNotSupported.
+                TimerType::get_timer::<TIMER>(TimerType::ChunkingNotSupported).await;
+                State::SendNotSupported(*power_source)
+            }
+            State::GiveRevision(power_source) => {
+                let revision = self.device_policy_manager.revision();
+                self.protocol_layer.transmit_revision(revision).await?;
+                State::Ready(*power_source, false)
+            }
+            State::GiveSinkCapExtended(power_source, block) => {
+                // PE_SNK_Give_Sink_Cap_Ext (section 9.2.9.4.1).
+                self.protocol_layer.transmit_sink_capabilities_extended(*block).await?;
+                State::Ready(*power_source, false)
+            }
+            State::GiveStatus(power_source, block) => {
+                self.protocol_layer.transmit_status(*block).await?;
+                self.device_policy_manager.status_sent(*block).await;
+                State::Ready(*power_source, false)
+            }
+            State::SendSinkAlert(power_source, ado) => {
+                self.protocol_layer.transmit_sink_alert(*ado).await?;
+                self.device_policy_manager.sink_alert_sent(*ado).await;
+                State::WaitForGetStatus(*power_source)
+            }
+            State::WaitForGetStatus(power_source) => {
+                // Figure 9.27: bounded wait from Alert GoodCRC, never a Hard Reset
+                // on timeout. Get_Status is also supported later from Ready.
+                let result = self
+                    .protocol_layer
+                    .receive_message_type(
+                        &[MessageType::Control(ControlMessageType::GetStatus)],
+                        TimerType::SenderResponse,
+                    )
+                    .await;
+                self.device_policy_manager.sink_alert_finished().await;
+                match result {
+                    Ok(_) => match self.device_policy_manager.status() {
+                        Some(block) => State::GiveStatus(*power_source, block),
+                        None => State::SendNotSupported(*power_source),
+                    },
+                    Err(ProtocolError::RxError(RxError::ReceiveTimeout)) => State::Ready(*power_source, false),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            State::GetPpsStatus(power_source) => {
+                // PE_SNK_Get_PPS_Status (section 9.2.11.3.1): send Get_PPS_Status,
+                // run SenderResponseTimer, return to Ready on PPS_Status or timeout.
                 self.protocol_layer
-                    .transmit_control_message(ControlMessageType::NotSupported)
+                    .transmit_control_message(ControlMessageType::GetPpsStatus)
                     .await?;
+                let result = self
+                    .protocol_layer
+                    .receive_message_type(
+                        &[
+                            MessageType::Extended(ExtendedMessageType::PpsStatus),
+                            MessageType::Control(ControlMessageType::NotSupported),
+                        ],
+                        TimerType::SenderResponse,
+                    )
+                    .await;
+                let outcome = match result {
+                    Ok(message) => match message.payload {
+                        Some(Payload::Extended(extended::Extended::PpsStatus(block))) => {
+                            PpsStatusOutcome::Status(block)
+                        }
+                        None => PpsStatusOutcome::NotSupported,
+                        // A PPS_Status without a valid 4-byte PPSSDB.
+                        Some(_) => return Err(ProtocolError::UnexpectedMessage.into()),
+                    },
+                    Err(ProtocolError::RxError(RxError::ReceiveTimeout)) => PpsStatusOutcome::Timeout,
+                    Err(e) => return Err(e.into()),
+                };
+                self.device_policy_manager.pps_status(outcome).await;
+                State::Ready(*power_source, false)
+            }
+            State::Query(power_source, query) => {
+                // Send the request, run SenderResponseTimer, return to Ready on the
+                // answer or the timeout (sections 9.2.9.1.1, 9.2.14.1.1, 9.2.16.1.1).
+                let answer = match query {
+                    PartnerQuery::SourceCapabilitiesExtended => {
+                        self.protocol_layer
+                            .transmit_control_message(ControlMessageType::GetSourceCapExtended)
+                            .await?;
+                        MessageType::Extended(ExtendedMessageType::SourceCapabilitiesExtended)
+                    }
+                    PartnerQuery::Revision => {
+                        self.protocol_layer
+                            .transmit_control_message(ControlMessageType::GetRevision)
+                            .await?;
+                        MessageType::Data(DataMessageType::Revision)
+                    }
+                    PartnerQuery::ManufacturerInfo => {
+                        self.protocol_layer.transmit_get_manufacturer_info().await?;
+                        MessageType::Extended(ExtendedMessageType::ManufacturerInfo)
+                    }
+                    PartnerQuery::SourceInfo => {
+                        self.protocol_layer
+                            .transmit_control_message(ControlMessageType::GetSourceInfo)
+                            .await?;
+                        MessageType::Data(DataMessageType::SourceInfo)
+                    }
+                    PartnerQuery::Status => {
+                        self.protocol_layer
+                            .transmit_control_message(ControlMessageType::GetStatus)
+                            .await?;
+                        MessageType::Extended(ExtendedMessageType::Status)
+                    }
+                };
+                let result = self
+                    .protocol_layer
+                    .receive_message_type(
+                        &[answer, MessageType::Control(ControlMessageType::NotSupported)],
+                        TimerType::SenderResponse,
+                    )
+                    .await;
+                let outcome = match result {
+                    Ok(message) => match message.payload {
+                        None => QueryOutcome::NotSupported,
+                        Some(Payload::Extended(extended::Extended::SourceCapabilitiesExtended(block))) => {
+                            QueryOutcome::Answer(heapless::Vec::from_slice(&block).expect("25 <= 26"))
+                        }
+                        Some(Payload::Extended(extended::Extended::ManufacturerInfo(block))) => {
+                            QueryOutcome::Answer(block)
+                        }
+                        Some(Payload::Data(Data::Revision(rmdo))) => {
+                            QueryOutcome::Answer(heapless::Vec::from_slice(&rmdo.to_le_bytes()).expect("4 <= 26"))
+                        }
+                        Some(Payload::Extended(extended::Extended::Status(block))) => {
+                            QueryOutcome::Answer(heapless::Vec::from_slice(&block).expect("7 <= 26"))
+                        }
+                        Some(Payload::Data(Data::SourceInfo(objects))) => {
+                            let mut block = heapless::Vec::new();
+                            for object in objects {
+                                block.extend_from_slice(&object.to_le_bytes()).expect("8 <= 26");
+                            }
+                            QueryOutcome::Answer(block)
+                        }
+                        // An answer without its valid Data Block.
+                        Some(_) => return Err(ProtocolError::UnexpectedMessage.into()),
+                    },
+                    Err(ProtocolError::RxError(RxError::ReceiveTimeout)) => QueryOutcome::Timeout,
+                    Err(e) => return Err(e.into()),
+                };
+                let (power_source, query) = (*power_source, *query);
+                self.device_policy_manager.query(query, outcome).await;
+                State::Ready(power_source, false)
+            }
+            State::SendNotSupported(power_source) => {
+                // PD2 V1.3 section 6.8.1 uses Reject; PD3 section 6.3.16
+                // introduces Not_Supported.
+                let response = match self
+                    .protocol_layer
+                    .header()
+                    .spec_revision()
+                    .expect("validated protocol header")
+                {
+                    SpecificationRevision::R1_0 | SpecificationRevision::R2_0 => ControlMessageType::Reject,
+                    SpecificationRevision::R3_X => ControlMessageType::NotSupported,
+                };
+                self.protocol_layer.transmit_control_message(response).await?;
 
+                State::Ready(*power_source, false)
+            }
+            State::BistCarrierMode(power_source) => {
+                // The driver runs the carrier and stops it within tBISTContMode
+                // (BISTContModeTimer, section 7.31.6.2).
+                if self.protocol_layer.transmit_bist_carrier().await? {
+                    // PE_SNK_Transition_to_default (section 9.2.4.9) without Hard
+                    // Reset: protocol reset, no contract, then PE_SNK_Startup. VBUS
+                    // stays at vSafe5V (the only level BIST runs at), so the
+                    // Discovery VBUS wait is already satisfied.
+                    self.contract = Default::default();
+                    self.established_request = None;
+                    self.wait_request = None;
+                    self.protocol_layer.reset();
+                    self.mode = Mode::Spr;
+                    self.source_capabilities = None;
+                    State::WaitForCapabilities
+                } else {
+                    State::Ready(*power_source, false)
+                }
+            }
+            State::BistTestData => {
+                // Section 6.4.3.1: received Messages get GoodCRC (protocol layer)
+                // and are not acted on; no timers, DPM events or responses. Only
+                // Hard Reset (an error from the protocol layer) leaves this state.
+                let _ = self.protocol_layer.receive_message().await?;
+                State::BistTestData
+            }
+            State::RejectSwap(power_source) => {
+                self.protocol_layer
+                    .transmit_control_message(ControlMessageType::Reject)
+                    .await?;
                 State::Ready(*power_source, false)
             }
             State::SendSoftReset => {
@@ -472,11 +918,13 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                 State::WaitForCapabilities
             }
             State::SoftReset => {
+                // Section 7.7 / 9.2.5.2.2: reset SOP counters before Accept.
+                // Do not reset again afterward: Accept consumes TX ID0.
+                self.protocol_layer.reset();
+                self.wait_request = None;
                 self.protocol_layer
                     .transmit_control_message(ControlMessageType::Accept)
                     .await?;
-
-                self.protocol_layer.reset();
 
                 State::WaitForCapabilities
             }

@@ -6,15 +6,25 @@ use crate::dummy::{DUMMY_CAPABILITIES, DummyDriver, DummySinkDevice, DummyTimer,
 use crate::protocol_layer::message::data::Data;
 use crate::protocol_layer::message::data::epr_mode::Action;
 use crate::protocol_layer::message::data::request::PowerSource;
-use crate::protocol_layer::message::data::source_capabilities::PowerDataObject;
+use crate::protocol_layer::message::data::source_capabilities::{PowerDataObject, SourceCapabilities};
 use crate::protocol_layer::message::header::{
     ControlMessageType, DataMessageType, ExtendedMessageType, Header, MessageType,
 };
 use crate::protocol_layer::message::{Message, Payload};
+use crate::sink::device_policy_manager::PpsStatusOutcome;
 use crate::sink::policy_engine::State;
 
 fn get_policy_engine() -> Sink<DummyDriver<MAX_DATA_MESSAGE_SIZE>, DummyTimer, DummySinkDevice> {
     Sink::new(DummyDriver::new(), DummySinkDevice {})
+}
+
+fn source_capabilities_fixture() -> SourceCapabilities {
+    let Some(Payload::Data(Data::SourceCapabilities(capabilities))) =
+        Message::from_bytes(&DUMMY_CAPABILITIES).unwrap().payload
+    else {
+        std::panic!("capabilities fixture");
+    };
+    capabilities
 }
 
 fn simulate_source_control_message<DPM: crate::sink::device_policy_manager::DevicePolicyManager>(
@@ -106,6 +116,37 @@ fn simulate_epr_keep_alive_ack<DPM: crate::sink::device_policy_manager::DevicePo
     let mut result = heapless::Vec::new();
     result.extend_from_slice(&buf[..len]).unwrap();
     result
+}
+
+#[tokio::test]
+async fn declined_change_preserves_established_request_and_default_wait_retry() {
+    use crate::protocol_layer::message::data::request::FixedVariableSupply;
+    for response in [ControlMessageType::Reject, ControlMessageType::Wait] {
+        let mut engine = get_policy_engine();
+        let established = PowerSource::FixedVariableSupply(FixedVariableSupply(0x1000_280a));
+        let attempted = PowerSource::FixedVariableSupply(FixedVariableSupply(0x2000_280a));
+        engine.contract = super::Contract::Explicit;
+        engine.established_request = Some(established);
+        engine.source_capabilities = Some(source_capabilities_fixture());
+        engine.state = State::SelectCapability(attempted);
+        simulate_source_control_message(&mut engine, ControlMessageType::GoodCRC, 0);
+        simulate_source_control_message(&mut engine, response, 1);
+        engine.run_step().await.unwrap();
+        let State::Ready(PowerSource::FixedVariableSupply(current), after_wait) = engine.state else {
+            std::panic!("declined request did not return to Ready");
+        };
+        std::assert_eq!(current.0, 0x1000_280a);
+        std::assert_eq!(after_wait, response == ControlMessageType::Wait);
+        if after_wait {
+            engine.run_step().await.unwrap();
+            std::assert!(
+                matches!(engine.state, State::SelectCapability(PowerSource::FixedVariableSupply(rdo))
+                if rdo.0 == 0x2000_280a)
+            );
+        } else {
+            std::assert!(engine.wait_request.is_none());
+        }
+    }
 }
 
 #[tokio::test]
@@ -580,4 +621,1231 @@ async fn test_epr_negotiation() {
 
     eprintln!("=== Phase 5 Complete: {} EPR keep-alive cycles succeeded ===\n", 3);
     eprintln!("=== Full EPR negotiation test PASSED ===");
+}
+
+/// Records PD3 Alerts; optionally a port without a Chunking layer and not EPR capable.
+#[derive(Default)]
+struct ReadyRecorder<const CHUNKING: bool> {
+    alerts: std::vec::Vec<u32>,
+}
+impl<const CHUNKING: bool> crate::sink::device_policy_manager::DevicePolicyManager for ReadyRecorder<CHUNKING> {
+    const CHUNKING: bool = CHUNKING;
+    const EPR: bool = CHUNKING;
+    async fn alert(&mut self, alert_data_object: u32) {
+        self.alerts.push(alert_data_object);
+    }
+    fn sink_capabilities_extended(&self) -> Option<[u8; 24]> {
+        CHUNKING.then(|| core::array::from_fn(|i| i as u8 + 1))
+    }
+}
+
+fn ready_engine<const CHUNKING: bool>() -> Sink<DummyDriver<MAX_DATA_MESSAGE_SIZE>, DummyTimer, ReadyRecorder<CHUNKING>>
+{
+    use crate::protocol_layer::message::data::request::FixedVariableSupply;
+    let mut engine = Sink::new(DummyDriver::new(), ReadyRecorder::default());
+    let established = PowerSource::FixedVariableSupply(FixedVariableSupply(0x1000_280a));
+    engine.contract = super::Contract::Explicit;
+    engine.established_request = Some(established);
+    engine.source_capabilities = Some(source_capabilities_fixture());
+    engine.state = State::Ready(established, false);
+    engine
+}
+/// PD3 source/DFP header word: kind, Data Objects, MessageID, extended flag.
+fn source_header(kind: u16, objects: u16, id: u16, extended: bool) -> u16 {
+    (extended as u16) << 15 | objects << 12 | id << 9 | 0x1a0 | kind
+}
+fn inject(
+    engine: &mut Sink<
+        DummyDriver<MAX_DATA_MESSAGE_SIZE>,
+        DummyTimer,
+        impl crate::sink::device_policy_manager::DevicePolicyManager,
+    >,
+    header: u16,
+    body: &[u8],
+) {
+    let mut bytes = header.to_le_bytes().to_vec();
+    bytes.extend_from_slice(body);
+    engine.protocol_layer.driver().inject_received_data(&bytes);
+}
+fn transmitted(
+    engine: &mut Sink<
+        DummyDriver<MAX_DATA_MESSAGE_SIZE>,
+        DummyTimer,
+        impl crate::sink::device_policy_manager::DevicePolicyManager,
+    >,
+) -> std::vec::Vec<MessageType> {
+    let mut kinds = std::vec::Vec::new();
+    while engine.protocol_layer.driver().has_transmitted_data() {
+        let bytes = engine.protocol_layer.driver().probe_transmitted_data();
+        kinds.push(Message::from_bytes(&bytes).unwrap().header.message_type());
+    }
+    kinds
+}
+const GOOD_CRC: MessageType = MessageType::Control(ControlMessageType::GoodCRC);
+
+#[tokio::test]
+async fn ready_get_revision_returns_the_revision_message() {
+    let mut engine = ready_engine::<true>();
+    inject(&mut engine, source_header(24, 0, 1, false), &[]);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::GiveRevision(_)));
+    simulate_source_control_message(&mut engine, ControlMessageType::GoodCRC, 0);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::Ready(..)));
+    engine.protocol_layer.driver().probe_transmitted_data(); // GoodCRC for Get_Revision
+    let revision = Message::from_bytes(&engine.protocol_layer.driver().probe_transmitted_data()).unwrap();
+    std::assert_eq!(
+        revision.header.message_type(),
+        MessageType::Data(DataMessageType::Revision)
+    );
+    std::assert_eq!(revision.header.num_objects(), 1);
+    std::assert!(matches!(
+        revision.payload,
+        Some(Payload::Data(Data::Revision(0x3212_0000)))
+    ));
+}
+
+#[tokio::test]
+async fn ready_get_sink_cap_extended_returns_one_padded_chunk() {
+    let mut engine = ready_engine::<true>();
+    inject(&mut engine, source_header(22, 0, 1, false), &[]);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::GiveSinkCapExtended(..)));
+    simulate_source_control_message(&mut engine, ControlMessageType::GoodCRC, 0);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::Ready(..)));
+    engine.protocol_layer.driver().probe_transmitted_data(); // GoodCRC for Get_Sink_Cap_Extended
+    let bytes = engine.protocol_layer.driver().probe_transmitted_data();
+    // Extended, 7 Data Objects, PD3, Sink/UFP; Chunked, Chunk 0, Data Size 24.
+    std::assert_eq!(bytes.len(), 30);
+    std::assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]) & 0xf1ff, 0xf08f);
+    std::assert_eq!(bytes[2..4], [0x18, 0x80]);
+    std::assert_eq!(bytes[4..28], core::array::from_fn::<u8, 24, _>(|i| i as u8 + 1));
+    std::assert_eq!(bytes[28..], [0, 0], "Table 6.48: padded with 00h");
+    // Without a Device Policy Manager SKEDB the request is unsupported.
+    let mut engine = ready_engine::<false>();
+    inject(&mut engine, source_header(22, 0, 1, false), &[]);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::SendNotSupported(_)));
+}
+
+#[tokio::test]
+async fn ready_dr_swap_and_vconn_swap_are_rejected_not_unsupported() {
+    // Section 7.12.1: the DR_Swap recipient Shall send Accept, Wait or Reject.
+    // Section 7.13: a VCONN_Swap recipient that is not the VCONN Source Rejects.
+    for kind in [9, 11] {
+        let mut engine = ready_engine::<true>();
+        inject(&mut engine, source_header(kind, 0, 1, false), &[]);
+        engine.run_step().await.unwrap();
+        std::assert!(matches!(engine.state, State::RejectSwap(_)), "{kind}");
+        simulate_source_control_message(&mut engine, ControlMessageType::GoodCRC, 0);
+        engine.run_step().await.unwrap();
+        std::assert!(matches!(engine.state, State::Ready(..)));
+        std::assert_eq!(
+            transmitted(&mut engine),
+            [GOOD_CRC, MessageType::Control(ControlMessageType::Reject)]
+        );
+    }
+}
+
+#[tokio::test]
+async fn bist_test_data_at_vsafe5v_sends_only_goodcrc_until_hard_reset() {
+    // Section 9.2.26.4.2: the fixture contract is object 1 (vSafe5V).
+    let mut engine = ready_engine::<true>();
+    let mut bist = 0x8000_0000u32.to_le_bytes().to_vec();
+    bist.extend([0x55; 24]);
+    inject(&mut engine, source_header(3, 7, 1, false), &bist);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::BistTestData));
+    inject(&mut engine, source_header(8, 0, 2, false), &[]); // Get_Sink_Cap
+    inject(&mut engine, source_header(13, 0, 0, false), &[]); // Soft_Reset
+    for _ in 0..2 {
+        engine.run_step().await.unwrap();
+        std::assert!(matches!(engine.state, State::BistTestData));
+    }
+    std::assert!(transmitted(&mut engine).iter().all(|kind| *kind == GOOD_CRC));
+    // Above vSafe5V (object 2) the same request gets GoodCRC only.
+    let mut engine = ready_engine::<true>();
+    let nine = PowerSource::FixedVariableSupply(crate::protocol_layer::message::data::request::FixedVariableSupply(
+        0x2000_280a,
+    ));
+    engine.established_request = Some(nine);
+    engine.state = State::Ready(nine, false);
+    inject(&mut engine, source_header(3, 7, 1, false), &bist);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::Ready(..)));
+}
+
+#[tokio::test]
+async fn bist_carrier_mode_at_vsafe5v_transitions_to_default_without_hard_reset() {
+    // Section 9.2.26.4.1.1: carrier, then PE_SNK_Transition_to_default and
+    // PE_SNK_Startup; no Hard Reset, no contract until fresh Source_Capabilities.
+    let mut engine = ready_engine::<true>();
+    engine.protocol_layer.driver().bist_carrier = true;
+    inject(
+        &mut engine,
+        source_header(3, 1, 1, false),
+        &0x5000_0000u32.to_le_bytes(),
+    );
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::BistCarrierMode(_)));
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::WaitForCapabilities));
+    std::assert_eq!(engine.protocol_layer.driver().bist_carriers, 1);
+    std::assert!(engine.established_request.is_none());
+    std::assert!(engine.source_capabilities.is_none());
+    std::assert_eq!(transmitted(&mut engine), [GOOD_CRC], "no Hard Reset or Message");
+    // A driver without carrier support sends nothing and Ready continues.
+    let mut engine = ready_engine::<true>();
+    inject(
+        &mut engine,
+        source_header(3, 1, 1, false),
+        &0x5000_0000u32.to_le_bytes(),
+    );
+    engine.run_step().await.unwrap();
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::Ready(..)));
+    std::assert_eq!(engine.protocol_layer.driver().bist_carriers, 0);
+}
+
+#[tokio::test]
+async fn ready_alert_bist_and_not_supported_get_goodcrc_only() {
+    let mut engine = ready_engine::<true>();
+    inject(
+        &mut engine,
+        source_header(6, 1, 1, false),
+        &0x1000_0000u32.to_le_bytes(),
+    );
+    inject(
+        &mut engine,
+        source_header(3, 1, 2, false),
+        &0x9000_0000u32.to_le_bytes(),
+    ); // Shared Test Mode Entry
+    inject(&mut engine, source_header(16, 0, 3, false), &[]);
+    for _ in 0..3 {
+        engine.run_step().await.unwrap();
+        std::assert!(matches!(engine.state, State::Ready(..)));
+    }
+    std::assert_eq!(engine.device_policy_manager.alerts, [0x1000_0000]);
+    std::assert_eq!(transmitted(&mut engine), [GOOD_CRC; 3]);
+}
+
+#[tokio::test]
+async fn epr_messages_are_unsupported_outside_epr_or_for_a_non_epr_sink() {
+    // EPR_Mode outside EPR Mode is not an exit notification.
+    let mut engine = ready_engine::<true>();
+    simulate_source_epr_mode_message(&mut engine, Action::Exit, 1);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::SendNotSupported(_)));
+    // A sink that is not EPR capable does not answer EPR_Get_Sink_Cap.
+    let mut engine = ready_engine::<false>();
+    inject(&mut engine, source_header(16, 1, 1, true), &[0x02, 0x80, 0x02, 0x00]);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::SendNotSupported(_)));
+    // A truncated ECDB is unsupported rather than a parser panic.
+    let mut engine = ready_engine::<true>();
+    inject(&mut engine, source_header(16, 0, 1, true), &[0x00, 0x00]);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::SendNotSupported(_)));
+}
+
+#[tokio::test]
+async fn without_chunking_layer_multi_chunk_messages_wait_then_get_not_supported() {
+    let mut engine = ready_engine::<false>();
+    let mut chunk = (0x8000u16 | 40).to_le_bytes().to_vec();
+    chunk.extend([0x5a; 26]);
+    inject(&mut engine, source_header(30, 7, 1, true), &chunk);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::ChunkReceived(_)));
+    std::assert_eq!(transmitted(&mut engine), [GOOD_CRC], "no Chunk request");
+    engine.run_step().await.unwrap(); // ChunkingNotSupportedTimer
+    std::assert!(matches!(engine.state, State::SendNotSupported(_)));
+    // A stray Chunk request is unsupported immediately.
+    inject(&mut engine, source_header(30, 1, 2, true), &[0x00, 0x8c, 0, 0]);
+    engine.state = State::Ready(engine.established_request.unwrap(), false);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::SendNotSupported(_)));
+    // Table 6.48: Invalid Chunk Number is Ignored; the next Message is serviced.
+    engine.state = State::Ready(engine.established_request.unwrap(), false);
+    inject(
+        &mut engine,
+        source_header(30, 2, 3, true),
+        &[0x28, 0xe0, 0, 0, 0, 0, 0, 0],
+    );
+    inject(&mut engine, source_header(8, 0, 4, false), &[]);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::GiveSinkCap(..)));
+}
+
+/// PHY with hardware GoodCRC/retry whose first `defer` transmissions are not
+/// sent (SinkTxNG or a received SOP Message, sections 7.2/7.3).
+struct DeferringDriver {
+    defer: usize,
+    tx: std::vec::Vec<std::vec::Vec<u8>>,
+}
+impl usbpd_traits::Driver for DeferringDriver {
+    const HAS_AUTO_GOOD_CRC: bool = true;
+    const HAS_AUTO_RETRY: bool = true;
+    async fn wait_for_vbus(&mut self) {}
+    async fn receive(&mut self, _buffer: &mut [u8]) -> Result<usize, usbpd_traits::DriverRxError> {
+        core::future::pending().await
+    }
+    async fn transmit(&mut self, data: &[u8]) -> Result<(), usbpd_traits::DriverTxError> {
+        if self.defer > 0 {
+            self.defer -= 1;
+            return Err(usbpd_traits::DriverTxError::Deferred);
+        }
+        self.tx.push(data.to_vec());
+        Ok(())
+    }
+    async fn transmit_hard_reset(&mut self) -> Result<(), usbpd_traits::DriverTxError> {
+        std::panic!("a deferred AMS start never escalates to Hard Reset")
+    }
+}
+#[derive(Default)]
+struct DeferredRecorder {
+    deferred: Option<PowerSource>,
+}
+impl crate::sink::device_policy_manager::DevicePolicyManager for DeferredRecorder {
+    async fn request_deferred(&mut self, requested: &PowerSource) {
+        self.deferred = Some(*requested);
+    }
+}
+
+#[tokio::test]
+async fn deferred_sink_initiated_request_returns_to_ready_without_using_a_message_id() {
+    use crate::protocol_layer::message::data::request::FixedVariableSupply;
+    let mut engine: Sink<DeferringDriver, DummyTimer, DeferredRecorder> = Sink::new(
+        DeferringDriver {
+            defer: 1,
+            tx: std::vec::Vec::new(),
+        },
+        DeferredRecorder::default(),
+    );
+    let established = PowerSource::FixedVariableSupply(FixedVariableSupply(0x1000_280a));
+    let attempted = PowerSource::FixedVariableSupply(FixedVariableSupply(0x2000_280a));
+    engine.contract = super::Contract::Explicit;
+    engine.established_request = Some(established);
+    engine.state = State::SelectCapability(attempted);
+    engine.run_step().await.unwrap();
+    let State::Ready(PowerSource::FixedVariableSupply(current), false) = engine.state else {
+        std::panic!("deferred request did not return to Ready");
+    };
+    std::assert_eq!(current.0, 0x1000_280a);
+    std::assert!(matches!(engine.device_policy_manager.deferred,
+        Some(PowerSource::FixedVariableSupply(rdo)) if rdo.0 == 0x2000_280a));
+    std::assert!(engine.protocol_layer.driver().tx.is_empty());
+    // Nothing was sent: the next Request still carries MessageID 0.
+    engine.protocol_layer.request_power(attempted).await.unwrap();
+    let sent = engine.protocol_layer.driver().tx[0].clone();
+    std::assert_eq!((sent[1] >> 1) & 7, 0);
+}
+
+#[tokio::test]
+async fn deferred_request_without_explicit_contract_is_not_turned_into_ready() {
+    use crate::protocol_layer::message::data::request::FixedVariableSupply;
+    let mut engine: Sink<DeferringDriver, DummyTimer, DeferredRecorder> = Sink::new(
+        DeferringDriver {
+            defer: 1,
+            tx: std::vec::Vec::new(),
+        },
+        DeferredRecorder::default(),
+    );
+    let attempted = PowerSource::FixedVariableSupply(FixedVariableSupply(0x2000_280a));
+    engine.state = State::SelectCapability(attempted);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::SelectCapability(_)));
+    std::assert!(engine.device_policy_manager.deferred.is_none());
+}
+
+/// Asks for the Source's PPS status once and records each outcome.
+#[derive(Default)]
+struct PpsStatusRecorder {
+    ask: bool,
+    outcomes: std::vec::Vec<PpsStatusOutcome>,
+}
+impl crate::sink::device_policy_manager::DevicePolicyManager for PpsStatusRecorder {
+    const CHUNKING: bool = false;
+    const EPR: bool = false;
+    async fn pps_status(&mut self, outcome: PpsStatusOutcome) {
+        self.outcomes.push(outcome);
+    }
+    async fn get_event(&mut self, _capabilities: &SourceCapabilities) -> crate::sink::device_policy_manager::Event {
+        if core::mem::take(&mut self.ask) {
+            crate::sink::device_policy_manager::Event::GetPpsStatus
+        } else {
+            core::future::pending().await
+        }
+    }
+}
+const PPS_CONTRACT: PowerSource = PowerSource::Pps(crate::protocol_layer::message::data::request::Pps(0x4002_d064));
+
+fn pps_engine(established: PowerSource) -> Sink<DummyDriver<MAX_DATA_MESSAGE_SIZE>, DummyTimer, PpsStatusRecorder> {
+    let mut engine = Sink::new(
+        DummyDriver::new(),
+        PpsStatusRecorder {
+            ask: true,
+            outcomes: std::vec::Vec::new(),
+        },
+    );
+    engine.contract = super::Contract::Explicit;
+    engine.established_request = Some(established);
+    engine.source_capabilities = Some(source_capabilities_fixture());
+    engine.state = State::Ready(established, false);
+    engine
+}
+
+/// Run Ready -> PE_SNK_Get_PPS_Status -> Ready with `reply` queued after the
+/// GoodCRC (MessageID `id`) for Get_PPS_Status; returns the transmitted Messages.
+async fn get_pps_status(
+    engine: &mut Sink<DummyDriver<MAX_DATA_MESSAGE_SIZE>, DummyTimer, PpsStatusRecorder>,
+    id: u8,
+    reply: Option<(u16, &[u8])>,
+) -> Result<std::vec::Vec<std::vec::Vec<u8>>, super::Error> {
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::GetPpsStatus(_)));
+    simulate_source_control_message(engine, ControlMessageType::GoodCRC, id);
+    if let Some((header, body)) = reply {
+        inject(engine, header, body);
+    }
+    engine.run_step().await?;
+    let mut sent = std::vec::Vec::new();
+    while engine.protocol_layer.driver().has_transmitted_data() {
+        sent.push(engine.protocol_layer.driver().probe_transmitted_data().to_vec());
+    }
+    Ok(sent)
+}
+
+#[tokio::test]
+async fn get_pps_status_reports_the_ppssdb_and_returns_to_ready() {
+    let mut engine = pps_engine(PPS_CONTRACT);
+    // Chunked, Chunk 0, Data Size 4; 9.00 V, 2.00 A, PTF normal, OMF CL; 00h padding.
+    let body = [0x04, 0x80, 0xc2, 0x01, 0x28, 0x0a, 0, 0];
+    let sent = get_pps_status(&mut engine, 0, Some((source_header(12, 2, 1, true), &body)))
+        .await
+        .unwrap();
+    std::assert!(matches!(engine.state, State::Ready(PowerSource::Pps(_), false)));
+    std::assert_eq!(
+        engine.device_policy_manager.outcomes,
+        [PpsStatusOutcome::Status([0xc2, 0x01, 0x28, 0x0a])]
+    );
+    // Get_PPS_Status: Control, no Data Objects, PD3, Sink/UFP (section 6.3.20).
+    std::assert_eq!(sent[0].len(), 2);
+    std::assert_eq!(u16::from_le_bytes([sent[0][0], sent[0][1]]) & 0xf1ff, 0x0094);
+    std::assert_eq!(Message::from_bytes(&sent[1]).unwrap().header.message_type(), GOOD_CRC);
+    std::assert_eq!(sent.len(), 2);
+}
+
+#[tokio::test]
+async fn get_pps_status_not_supported_or_timeout_returns_to_ready() {
+    let mut engine = pps_engine(PPS_CONTRACT);
+    get_pps_status(&mut engine, 0, Some((source_header(16, 0, 1, false), &[])))
+        .await
+        .unwrap();
+    std::assert!(matches!(engine.state, State::Ready(..)));
+    // Figure 9.37: SenderResponseTimer timeout is a normal exit, never a reset.
+    engine.device_policy_manager.ask = true;
+    get_pps_status(&mut engine, 1, None).await.unwrap();
+    std::assert!(matches!(engine.state, State::Ready(..)));
+    std::assert_eq!(
+        engine.device_policy_manager.outcomes,
+        [PpsStatusOutcome::NotSupported, PpsStatusOutcome::Timeout]
+    );
+}
+
+#[tokio::test]
+async fn get_pps_status_malformed_or_unexpected_reply_is_a_protocol_error() {
+    // Data Size 3 is not a PPSSDB (Table 6.58).
+    let mut engine = pps_engine(PPS_CONTRACT);
+    let body = [0x03, 0x80, 0xc2, 0x01, 0x28, 0, 0, 0];
+    get_pps_status(&mut engine, 0, Some((source_header(12, 2, 1, true), &body)))
+        .await
+        .unwrap();
+    std::assert!(matches!(engine.state, State::SendSoftReset));
+    std::assert!(engine.device_policy_manager.outcomes.is_empty());
+    // Accept is not an answer to Get_PPS_Status.
+    let mut engine = pps_engine(PPS_CONTRACT);
+    get_pps_status(&mut engine, 0, Some((source_header(3, 0, 1, false), &[])))
+        .await
+        .unwrap();
+    std::assert!(matches!(engine.state, State::SendSoftReset));
+    std::assert!(engine.device_policy_manager.outcomes.is_empty());
+}
+
+#[tokio::test]
+async fn get_pps_status_needs_a_pd3_pps_contract() {
+    use crate::protocol_layer::message::data::request::FixedVariableSupply;
+    let mut engine = pps_engine(PowerSource::FixedVariableSupply(FixedVariableSupply(0x1000_280a)));
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(
+        engine.state,
+        State::Ready(PowerSource::FixedVariableSupply(_), false)
+    ));
+    std::assert_eq!(engine.device_policy_manager.outcomes, [PpsStatusOutcome::NotSent]);
+    std::assert!(!engine.protocol_layer.driver().has_transmitted_data());
+}
+
+#[tokio::test]
+async fn deferred_get_pps_status_returns_to_ready_without_using_a_message_id() {
+    let mut engine: Sink<DeferringDriver, DummyTimer, PpsStatusRecorder> = Sink::new(
+        DeferringDriver {
+            defer: 1,
+            tx: std::vec::Vec::new(),
+        },
+        PpsStatusRecorder::default(),
+    );
+    engine.contract = super::Contract::Explicit;
+    engine.established_request = Some(PPS_CONTRACT);
+    engine.state = State::GetPpsStatus(PPS_CONTRACT);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::Ready(PowerSource::Pps(_), false)));
+    std::assert_eq!(engine.device_policy_manager.outcomes, [PpsStatusOutcome::Deferred]);
+    std::assert!(engine.protocol_layer.driver().tx.is_empty());
+    engine
+        .protocol_layer
+        .transmit_control_message(ControlMessageType::GetPpsStatus)
+        .await
+        .unwrap();
+    std::assert_eq!((engine.protocol_layer.driver().tx[0][1] >> 1) & 7, 0);
+}
+
+const SOFT_RESET: MessageType = MessageType::Control(ControlMessageType::SoftReset);
+
+#[tokio::test]
+async fn startup_soft_reset_uses_peer_revision_without_locking_capability_detection() {
+    for revision in [1u8, 2] {
+        let mut engine = get_policy_engine();
+        engine.state = State::WaitForCapabilities;
+        inject(
+            &mut engine,
+            source_header(13, 0, 0, false) & !0xc0 | u16::from(revision) << 6,
+            &[],
+        );
+        engine.run_step().await.unwrap();
+        std::assert!(matches!(engine.state, State::SoftReset));
+        simulate_source_control_message(&mut engine, ControlMessageType::GoodCRC, 0);
+        engine.run_step().await.unwrap();
+        std::assert!(matches!(engine.state, State::WaitForCapabilities));
+        let accept = engine.protocol_layer.driver().probe_transmitted_data();
+        let accept = Message::from_bytes(&accept).unwrap();
+        std::assert_eq!(
+            accept.header.message_type(),
+            MessageType::Control(ControlMessageType::Accept)
+        );
+        std::assert_eq!(accept.header.message_id(), 0);
+        std::assert_eq!(u8::from(accept.header.spec_revision().unwrap()), revision);
+        // Section 6.1.3.1: the first Request still derives its revision from
+        // fresh Source_Capabilities, not from the startup reset.
+        let fresh = 3 - revision;
+        let mut caps = DUMMY_CAPABILITIES;
+        caps[0] = (caps[0] & !0xc0) | fresh << 6;
+        engine.protocol_layer.driver().inject_received_data(&caps);
+        engine.run_step().await.unwrap();
+        std::assert!(matches!(engine.state, State::EvaluateCapabilities(_)));
+        std::assert_eq!(u8::from(engine.protocol_layer.header().spec_revision().unwrap()), fresh);
+    }
+}
+
+#[tokio::test]
+async fn ready_unexpected_accept_reject_ps_rdy_or_wait_initiates_soft_reset() {
+    // Table 7.1: Recognized, Supported, Unexpected in PE_SNK_Ready -> Soft_Reset.
+    for kind in [3, 4, 6, 12] {
+        let mut engine = ready_engine::<false>();
+        inject(&mut engine, source_header(kind, 0, 5, false), &[]);
+        engine.run_step().await.unwrap();
+        std::assert!(matches!(engine.state, State::SendSoftReset), "kind {kind}");
+        std::assert_eq!(transmitted(&mut engine), [GOOD_CRC]);
+        // Section 9.2.5.2.1: protocol reset, Soft_Reset with MessageID 0, Accept -> Wait_for_Capabilities.
+        simulate_source_control_message(&mut engine, ControlMessageType::GoodCRC, 0);
+        inject(&mut engine, source_header(3, 0, 0, false), &[]);
+        engine.run_step().await.unwrap();
+        std::assert!(matches!(engine.state, State::WaitForCapabilities));
+        let soft_reset = engine.protocol_layer.driver().probe_transmitted_data();
+        let soft_reset = Message::from_bytes(&soft_reset).unwrap();
+        std::assert_eq!(soft_reset.header.message_type(), SOFT_RESET);
+        std::assert_eq!(soft_reset.header.message_id(), 0);
+        std::assert_eq!(transmitted(&mut engine), [GOOD_CRC], "GoodCRC for the Accept");
+    }
+}
+
+#[tokio::test]
+async fn send_soft_reset_escalates_to_hard_reset_and_never_repeats_itself() {
+    // Section 9.2.5.2.1: SenderResponseTimer timeout -> PE_SNK_Hard_Reset.
+    let mut engine = ready_engine::<false>();
+    engine.state = State::SendSoftReset;
+    simulate_source_control_message(&mut engine, ControlMessageType::GoodCRC, 0);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::HardReset));
+    // Section 7.7: a Protocol Error during the Soft Reset -> Hard Reset.
+    let mut engine = ready_engine::<false>();
+    engine.state = State::SendSoftReset;
+    simulate_source_control_message(&mut engine, ControlMessageType::GoodCRC, 0);
+    inject(&mut engine, source_header(6, 0, 0, false), &[]);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::HardReset));
+    // An Unrecognized Message there is not answered with another Soft_Reset either.
+    let mut engine = ready_engine::<false>();
+    engine.state = State::SendSoftReset;
+    simulate_source_control_message(&mut engine, ControlMessageType::GoodCRC, 0);
+    inject(&mut engine, source_header(31, 0, 0, false), &[]);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::HardReset));
+    // Section 9.2.5.2.2: the Port Partner's own Soft_Reset wins.
+    let mut engine = ready_engine::<false>();
+    engine.state = State::SendSoftReset;
+    simulate_source_control_message(&mut engine, ControlMessageType::GoodCRC, 0);
+    inject(&mut engine, source_header(13, 0, 0, false), &[]);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::SoftReset));
+}
+
+#[tokio::test]
+async fn unsupported_message_during_request_ams_initiates_soft_reset_not_a_new_request() {
+    let mut engine = ready_engine::<false>();
+    let established = engine.established_request.unwrap();
+    engine.state = State::SelectCapability(established);
+    simulate_source_control_message(&mut engine, ControlMessageType::GoodCRC, 0);
+    inject(&mut engine, source_header(31, 0, 1, false), &[]);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::SendSoftReset));
+    // A Source_Capabilities instead of Accept is an Unexpected Message (Figure 9.18 note 1).
+    let mut engine = ready_engine::<false>();
+    engine.state = State::SelectCapability(established);
+    simulate_source_control_message(&mut engine, ControlMessageType::GoodCRC, 0);
+    engine.protocol_layer.driver().inject_received_data(&DUMMY_CAPABILITIES);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::SendSoftReset));
+}
+
+/// Hardware-retry PHY whose next `nack` transmissions get no GoodCRC.
+struct NackDriver {
+    nack: usize,
+    tx: std::vec::Vec<std::vec::Vec<u8>>,
+}
+impl usbpd_traits::Driver for NackDriver {
+    const HAS_AUTO_GOOD_CRC: bool = true;
+    const HAS_AUTO_RETRY: bool = true;
+    async fn wait_for_vbus(&mut self) {}
+    async fn receive(&mut self, _buffer: &mut [u8]) -> Result<usize, usbpd_traits::DriverRxError> {
+        core::future::pending().await
+    }
+    async fn transmit(&mut self, data: &[u8]) -> Result<(), usbpd_traits::DriverTxError> {
+        self.tx.push(data.to_vec());
+        if self.nack > 0 {
+            self.nack -= 1;
+            return Err(usbpd_traits::DriverTxError::NotAcknowledged);
+        }
+        Ok(())
+    }
+    async fn transmit_hard_reset(&mut self) -> Result<(), usbpd_traits::DriverTxError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn not_acknowledged_message_soft_resets_and_a_not_acknowledged_soft_reset_hard_resets() {
+    use crate::protocol_layer::message::data::request::FixedVariableSupply;
+    let established = PowerSource::FixedVariableSupply(FixedVariableSupply(0x1000_280a));
+    let mut engine: Sink<NackDriver, DummyTimer, DummySinkDevice> = Sink::new(
+        NackDriver {
+            nack: 2,
+            tx: std::vec::Vec::new(),
+        },
+        DummySinkDevice {},
+    );
+    engine.contract = super::Contract::Explicit;
+    engine.established_request = Some(established);
+    engine.state = State::SelectCapability(established);
+    // Section 7.1.1: no GoodCRC after nRetryCount retries -> PE_SNK_Send_Soft_Reset.
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::SendSoftReset));
+    // Section 7.1.1: a Soft_Reset that fails -> Hard Reset.
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::HardReset));
+    let tx = &engine.protocol_layer.driver().tx;
+    std::assert_eq!(tx.len(), 2);
+    std::assert_eq!(tx[1][0] & 0x1f, 13);
+    std::assert_eq!((tx[1][1] >> 1) & 7, 0, "Soft_Reset uses MessageID 0");
+}
+
+/// Ready -> unexpected Accept -> PE_SNK_Send_Soft_Reset -> Accept (MessageID 0)
+/// -> PE_SNK_Wait_for_Capabilities, recovering.
+async fn recovering_engine() -> Sink<DummyDriver<MAX_DATA_MESSAGE_SIZE>, DummyTimer, ReadyRecorder<false>> {
+    let mut engine = ready_engine::<false>();
+    inject(&mut engine, source_header(3, 0, 5, false), &[]);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::SendSoftReset) && engine.recovering);
+    simulate_source_control_message(&mut engine, ControlMessageType::GoodCRC, 0);
+    inject(&mut engine, source_header(3, 0, 0, false), &[]);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::WaitForCapabilities) && engine.recovering);
+    transmitted(&mut engine);
+    engine
+}
+
+/// Fresh Source_Capabilities (MessageID 1) -> our Request (MessageID 1) acknowledged.
+async fn renegotiate(engine: &mut Sink<DummyDriver<MAX_DATA_MESSAGE_SIZE>, DummyTimer, ReadyRecorder<false>>) {
+    let mut capabilities = DUMMY_CAPABILITIES;
+    capabilities[1] |= 1 << 1;
+    engine.protocol_layer.driver().inject_received_data(&capabilities);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::EvaluateCapabilities(_)));
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::SelectCapability(_)));
+    simulate_source_control_message(engine, ControlMessageType::GoodCRC, 1);
+}
+
+#[tokio::test]
+async fn a_protocol_error_while_recovering_hard_resets_instead_of_a_second_soft_reset() {
+    // Section 7.1.1: the Soft Reset did not correct the error. PS_RDY instead of
+    // fresh capabilities after our Soft_Reset's Accept.
+    let mut engine = recovering_engine().await;
+    inject(&mut engine, source_header(6, 0, 1, false), &[]);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::HardReset));
+    // An Unrecognized Message instead of the renegotiated Request's answer.
+    let mut engine = recovering_engine().await;
+    renegotiate(&mut engine).await;
+    inject(&mut engine, source_header(31, 0, 2, false), &[]);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::HardReset));
+    // An Unexpected one (Source_Capabilities, Figure 9.18 note 1).
+    let mut engine = recovering_engine().await;
+    renegotiate(&mut engine).await;
+    let mut capabilities = DUMMY_CAPABILITIES;
+    capabilities[1] |= 2 << 1;
+    engine.protocol_layer.driver().inject_received_data(&capabilities);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::HardReset));
+    // An Unrecognized Message while waiting for capabilities is not ignored either.
+    let mut engine = recovering_engine().await;
+    inject(&mut engine, source_header(31, 0, 1, false), &[]);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::HardReset));
+    // A partner Soft_Reset is still accepted (section 9.2.5.2.2).
+    let mut engine = recovering_engine().await;
+    inject(&mut engine, source_header(13, 0, 0, false), &[]);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::SoftReset) && engine.recovering);
+}
+
+#[tokio::test]
+async fn a_not_acknowledged_message_while_recovering_hard_resets() {
+    use crate::protocol_layer::message::data::request::FixedVariableSupply;
+    let established = PowerSource::FixedVariableSupply(FixedVariableSupply(0x1000_280a));
+    let mut engine: Sink<NackDriver, DummyTimer, DummySinkDevice> = Sink::new(
+        NackDriver {
+            nack: 1,
+            tx: std::vec::Vec::new(),
+        },
+        DummySinkDevice {},
+    );
+    engine.contract = super::Contract::Explicit;
+    engine.established_request = Some(established);
+    engine.state = State::SelectCapability(established);
+    engine.recovering = true;
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::HardReset));
+    std::assert_eq!(engine.protocol_layer.driver().tx.len(), 1, "no Soft_Reset");
+}
+
+#[tokio::test]
+async fn ps_rdy_reject_or_wait_end_recovery_so_a_later_error_soft_resets_again() {
+    // PS_RDY of the renegotiated contract.
+    let mut engine = recovering_engine().await;
+    renegotiate(&mut engine).await;
+    inject(&mut engine, source_header(3, 0, 2, false), &[]);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::TransitionSink(_)) && engine.recovering);
+    inject(&mut engine, source_header(6, 0, 3, false), &[]);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::Ready(..)) && !engine.recovering);
+    inject(&mut engine, source_header(3, 0, 4, false), &[]);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::SendSoftReset));
+    // Reject or Wait under the kept Explicit Contract.
+    for kind in [4, 12] {
+        let mut engine = recovering_engine().await;
+        renegotiate(&mut engine).await;
+        inject(&mut engine, source_header(kind, 0, 2, false), &[]);
+        engine.run_step().await.unwrap();
+        std::assert!(
+            matches!(engine.state, State::Ready(..)) && !engine.recovering,
+            "kind {kind}"
+        );
+        // Before any Explicit Contract they lead to Wait_for_Capabilities, also
+        // not recovering: a later error there is answered with Soft_Reset again.
+        let mut engine = recovering_engine().await;
+        renegotiate(&mut engine).await;
+        engine.contract = super::Contract::Safe5V;
+        inject(&mut engine, source_header(kind, 0, 2, false), &[]);
+        engine.run_step().await.unwrap();
+        std::assert!(
+            matches!(engine.state, State::WaitForCapabilities) && !engine.recovering,
+            "kind {kind}"
+        );
+        inject(&mut engine, source_header(6, 0, 3, false), &[]);
+        engine.run_step().await.unwrap();
+        std::assert!(matches!(engine.state, State::SendSoftReset), "kind {kind}");
+    }
+}
+
+#[tokio::test]
+async fn a_protocol_error_while_power_transitions_hard_resets() {
+    // Table 7.1, section 9.2.4.6: during PE_SNK_Transition_Sink.
+    let mut engine = ready_engine::<false>();
+    let established = engine.established_request.unwrap();
+    engine.state = State::TransitionSink(established);
+    inject(&mut engine, source_header(3, 0, 1, false), &[]);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::HardReset));
+    // PSTransitionTimer timeout.
+    let mut engine = ready_engine::<false>();
+    engine.state = State::TransitionSink(established);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::HardReset));
+}
+
+/// Asks the queued information requests in order and records each outcome.
+#[derive(Default)]
+struct QueryRecorder {
+    ask: std::vec::Vec<crate::sink::device_policy_manager::PartnerQuery>,
+    outcomes: std::vec::Vec<(
+        crate::sink::device_policy_manager::PartnerQuery,
+        crate::sink::device_policy_manager::QueryOutcome,
+    )>,
+}
+impl crate::sink::device_policy_manager::DevicePolicyManager for QueryRecorder {
+    const CHUNKING: bool = false;
+    const EPR: bool = false;
+    async fn query(
+        &mut self,
+        query: crate::sink::device_policy_manager::PartnerQuery,
+        outcome: crate::sink::device_policy_manager::QueryOutcome,
+    ) {
+        self.outcomes.push((query, outcome));
+    }
+    async fn get_event(&mut self, _capabilities: &SourceCapabilities) -> crate::sink::device_policy_manager::Event {
+        if self.ask.is_empty() {
+            core::future::pending().await
+        } else {
+            crate::sink::device_policy_manager::Event::Query(self.ask.remove(0))
+        }
+    }
+}
+
+fn query_engine(
+    ask: crate::sink::device_policy_manager::PartnerQuery,
+) -> Sink<DummyDriver<MAX_DATA_MESSAGE_SIZE>, DummyTimer, QueryRecorder> {
+    use crate::protocol_layer::message::data::request::FixedVariableSupply;
+    let mut engine = Sink::new(
+        DummyDriver::new(),
+        QueryRecorder {
+            ask: std::vec![ask],
+            outcomes: std::vec::Vec::new(),
+        },
+    );
+    let established = PowerSource::FixedVariableSupply(FixedVariableSupply(0x1000_280a));
+    engine.contract = super::Contract::Explicit;
+    engine.established_request = Some(established);
+    engine.source_capabilities = Some(source_capabilities_fixture());
+    engine.state = State::Ready(established, false);
+    engine
+}
+
+/// Run Ready -> query state -> Ready with `reply` queued after the GoodCRC for
+/// the request; returns the transmitted Messages.
+async fn query(
+    engine: &mut Sink<DummyDriver<MAX_DATA_MESSAGE_SIZE>, DummyTimer, QueryRecorder>,
+    reply: Option<(u16, &[u8])>,
+) -> std::vec::Vec<std::vec::Vec<u8>> {
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::Query(..)));
+    simulate_source_control_message(engine, ControlMessageType::GoodCRC, 0);
+    if let Some((header, body)) = reply {
+        inject(engine, header, body);
+    }
+    engine.run_step().await.unwrap();
+    let mut sent = std::vec::Vec::new();
+    while engine.protocol_layer.driver().has_transmitted_data() {
+        sent.push(engine.protocol_layer.driver().probe_transmitted_data().to_vec());
+    }
+    sent
+}
+
+/// One Chunked Chunk 0 extended reply body: Extended Header, block, 00h padding.
+fn chunk(block: &[u8]) -> (u16, std::vec::Vec<u8>) {
+    let mut body = std::vec![block.len() as u8, 0x80];
+    body.extend_from_slice(block);
+    while body.len() % 4 != 0 {
+        body.push(0);
+    }
+    ((body.len() / 4) as u16, body)
+}
+
+#[tokio::test]
+async fn get_source_cap_extended_reports_the_scedb_and_returns_to_ready() {
+    use crate::sink::device_policy_manager::PartnerQuery::SourceCapabilitiesExtended as Sce;
+    use crate::sink::device_policy_manager::QueryOutcome;
+    // Section 6.5: a 24-byte PD R3.0 block, the 25-byte block, and a longer one
+    // whose extra byte is Ignored (Table 6.48 Data Size).
+    for (size, kept) in [(24usize, 24usize), (25, 25), (26, 25)] {
+        let mut engine = query_engine(Sce);
+        let block: std::vec::Vec<u8> = (1..=size as u8).collect();
+        let (objects, body) = chunk(&block);
+        let sent = query(&mut engine, Some((source_header(1, objects, 1, true), &body))).await;
+        std::assert!(matches!(engine.state, State::Ready(..)));
+        // Get_Source_Cap_Extended: Control, no Data Objects, PD3, Sink/UFP.
+        std::assert_eq!(sent[0].len(), 2);
+        std::assert_eq!(u16::from_le_bytes([sent[0][0], sent[0][1]]) & 0xf1ff, 0x0091);
+        std::assert_eq!(Message::from_bytes(&sent[1]).unwrap().header.message_type(), GOOD_CRC);
+        let QueryOutcome::Answer(answer) = &engine.device_policy_manager.outcomes[0].1 else {
+            std::panic!("no answer")
+        };
+        std::assert_eq!(answer.as_slice(), &block[..kept]);
+    }
+}
+
+#[tokio::test]
+async fn get_revision_reports_the_rmdo() {
+    use crate::sink::device_policy_manager::PartnerQuery::Revision;
+    use crate::sink::device_policy_manager::QueryOutcome;
+    let mut engine = query_engine(Revision);
+    let sent = query(
+        &mut engine,
+        Some((source_header(12, 1, 1, false), &0x3118_0000u32.to_le_bytes())),
+    )
+    .await;
+    std::assert_eq!(u16::from_le_bytes([sent[0][0], sent[0][1]]) & 0xf1ff, 0x0098);
+    std::assert!(matches!(engine.state, State::Ready(..)));
+    std::assert_eq!(
+        engine.device_policy_manager.outcomes,
+        [(
+            Revision,
+            QueryOutcome::Answer(heapless::Vec::from_slice(&[0, 0, 0x18, 0x31]).unwrap())
+        )]
+    );
+}
+
+#[tokio::test]
+async fn get_manufacturer_info_asks_for_the_port_and_reports_the_block() {
+    use crate::sink::device_policy_manager::PartnerQuery::ManufacturerInfo;
+    use crate::sink::device_policy_manager::QueryOutcome;
+    let mut engine = query_engine(ManufacturerInfo);
+    let block = *b"\x34\x12\x78\x56ACME 65W\0";
+    let (objects, body) = chunk(&block);
+    let sent = query(&mut engine, Some((source_header(7, objects, 1, true), &body))).await;
+    // Extended, one Data Object, PD3, Sink/UFP, type 00110b; Chunked Chunk 0
+    // of 2 bytes: Target 0 (Port), Ref 0 (Reserved), Table 6.56.
+    std::assert_eq!(sent[0].len(), 6);
+    std::assert_eq!(u16::from_le_bytes([sent[0][0], sent[0][1]]) & 0xf1ff, 0x9086);
+    std::assert_eq!(sent[0][2..], [0x02, 0x80, 0, 0]);
+    std::assert!(matches!(engine.state, State::Ready(..)));
+    std::assert_eq!(
+        engine.device_policy_manager.outcomes,
+        [(
+            ManufacturerInfo,
+            QueryOutcome::Answer(heapless::Vec::from_slice(&block).unwrap())
+        )]
+    );
+}
+
+#[tokio::test]
+async fn queries_not_supported_or_timeout_return_to_ready() {
+    use crate::sink::device_policy_manager::{PartnerQuery, QueryOutcome};
+    for ask in [
+        PartnerQuery::SourceCapabilitiesExtended,
+        PartnerQuery::Revision,
+        PartnerQuery::ManufacturerInfo,
+    ] {
+        let mut engine = query_engine(ask);
+        query(&mut engine, Some((source_header(16, 0, 1, false), &[]))).await;
+        std::assert!(matches!(engine.state, State::Ready(..)));
+        // A SenderResponseTimer timeout is a normal exit, never a reset.
+        engine.device_policy_manager.ask.push(ask);
+        engine.run_step().await.unwrap();
+        simulate_source_control_message(&mut engine, ControlMessageType::GoodCRC, 1);
+        engine.run_step().await.unwrap();
+        std::assert!(matches!(engine.state, State::Ready(..)));
+        std::assert_eq!(
+            engine.device_policy_manager.outcomes,
+            [(ask, QueryOutcome::NotSupported), (ask, QueryOutcome::Timeout)]
+        );
+    }
+}
+
+#[tokio::test]
+async fn malformed_or_unexpected_query_answers_are_a_protocol_error() {
+    use crate::sink::device_policy_manager::PartnerQuery;
+    // A 23-byte SCEDB, a 3-byte Manufacturer_Info, a Revision without an RMDO
+    // (a Wait header), and an Accept.
+    let short_scedb = chunk(&[0; 23]);
+    let short_info = chunk(&[0; 3]);
+    let cases: [(PartnerQuery, u16, &[u8]); 4] = [
+        (
+            PartnerQuery::SourceCapabilitiesExtended,
+            source_header(1, short_scedb.0, 1, true),
+            &short_scedb.1,
+        ),
+        (
+            PartnerQuery::ManufacturerInfo,
+            source_header(7, short_info.0, 1, true),
+            &short_info.1,
+        ),
+        (PartnerQuery::Revision, source_header(12, 0, 1, false), &[]),
+        (PartnerQuery::Revision, source_header(3, 0, 1, false), &[]),
+    ];
+    for (ask, header, body) in cases {
+        let mut engine = query_engine(ask);
+        query(&mut engine, Some((header, body))).await;
+        std::assert!(matches!(engine.state, State::SendSoftReset), "{ask:?}");
+        std::assert!(engine.device_policy_manager.outcomes.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn queries_need_pd3() {
+    use crate::sink::device_policy_manager::{PartnerQuery, QueryOutcome};
+    let mut engine = query_engine(PartnerQuery::Revision);
+    // PD2 Source_Capabilities select PD2 before the first Request (section 6.2.1.1.5).
+    let mut caps = DUMMY_CAPABILITIES;
+    caps[0] = (caps[0] & !0xc0) | 0x40;
+    engine.protocol_layer.driver().inject_received_data(&caps);
+    engine.protocol_layer.receive_message().await.unwrap();
+    engine.protocol_layer.driver().probe_transmitted_data();
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::Ready(..)));
+    std::assert_eq!(
+        engine.device_policy_manager.outcomes,
+        [(PartnerQuery::Revision, QueryOutcome::NotSent)]
+    );
+    std::assert!(!engine.protocol_layer.driver().has_transmitted_data());
+}
+
+#[tokio::test]
+async fn deferred_query_returns_to_ready_without_using_a_message_id() {
+    use crate::protocol_layer::message::data::request::FixedVariableSupply;
+    use crate::sink::device_policy_manager::{PartnerQuery, QueryOutcome};
+    let mut engine: Sink<DeferringDriver, DummyTimer, QueryRecorder> = Sink::new(
+        DeferringDriver {
+            defer: 1,
+            tx: std::vec::Vec::new(),
+        },
+        QueryRecorder::default(),
+    );
+    let established = PowerSource::FixedVariableSupply(FixedVariableSupply(0x1000_280a));
+    engine.contract = super::Contract::Explicit;
+    engine.established_request = Some(established);
+    engine.state = State::Query(established, PartnerQuery::ManufacturerInfo);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::Ready(..)));
+    std::assert_eq!(
+        engine.device_policy_manager.outcomes,
+        [(PartnerQuery::ManufacturerInfo, QueryOutcome::Deferred)]
+    );
+    std::assert!(engine.protocol_layer.driver().tx.is_empty());
+    engine.protocol_layer.transmit_get_manufacturer_info().await.unwrap();
+    std::assert_eq!((engine.protocol_layer.driver().tx[0][1] >> 1) & 7, 0);
+}
+
+#[tokio::test]
+async fn get_source_info_reports_one_or_two_sidos_and_ignores_more() {
+    use crate::sink::device_policy_manager::PartnerQuery::SourceInfo;
+    use crate::sink::device_policy_manager::QueryOutcome;
+    // R3.1 Sources send SIDO1 only; R3.2 V1.2 adds SIDO2; further objects are Ignored.
+    for objects in [
+        &[0x8a8c_8c8cu32][..],
+        &[0x8a8c_8c8c, 0x0001_1918],
+        &[0x8a8c_8c8c, 0x0001_1918, 7],
+    ] {
+        let mut engine = query_engine(SourceInfo);
+        let body: std::vec::Vec<u8> = objects.iter().flat_map(|o| o.to_le_bytes()).collect();
+        let sent = query(
+            &mut engine,
+            Some((source_header(11, objects.len() as u16, 1, false), &body)),
+        )
+        .await;
+        // Get_Source_Info: Control 10111b, PD3, Sink/UFP.
+        std::assert_eq!(u16::from_le_bytes([sent[0][0], sent[0][1]]) & 0xf1ff, 0x0097);
+        std::assert!(matches!(engine.state, State::Ready(..)));
+        let kept = objects.len().min(2) * 4;
+        std::assert_eq!(
+            engine.device_policy_manager.outcomes,
+            [(
+                SourceInfo,
+                QueryOutcome::Answer(heapless::Vec::from_slice(&body[..kept]).unwrap())
+            )]
+        );
+    }
+}
+
+#[tokio::test]
+async fn get_status_reports_the_sdb_and_accepts_older_shorter_blocks() {
+    use crate::sink::device_policy_manager::PartnerQuery::Status;
+    use crate::sink::device_policy_manager::QueryOutcome;
+    // Section 6.5: a 5-byte PD R3.0 SDB is valid; bytes past the 7 are Ignored.
+    for (size, kept) in [(5usize, 5usize), (7, 7), (8, 7)] {
+        let mut engine = query_engine(Status);
+        let block: std::vec::Vec<u8> = (1..=size as u8).collect();
+        let (objects, body) = chunk(&block);
+        let sent = query(&mut engine, Some((source_header(2, objects, 1, true), &body))).await;
+        // Get_Status: Control 10010b, PD3, Sink/UFP.
+        std::assert_eq!(u16::from_le_bytes([sent[0][0], sent[0][1]]) & 0xf1ff, 0x0092);
+        std::assert!(matches!(engine.state, State::Ready(..)));
+        std::assert_eq!(
+            engine.device_policy_manager.outcomes,
+            [(
+                Status,
+                QueryOutcome::Answer(heapless::Vec::from_slice(&block[..kept]).unwrap())
+            )]
+        );
+    }
+    // A 4-byte block is not an SDB: a Protocol Error.
+    let mut engine = query_engine(Status);
+    let (objects, body) = chunk(&[0; 4]);
+    query(&mut engine, Some((source_header(2, objects, 1, true), &body))).await;
+    std::assert!(matches!(engine.state, State::SendSoftReset));
+}
+
+#[derive(Default)]
+struct SinkAlertRecorder {
+    ask: Option<u32>,
+    sent: usize,
+    not_sent: usize,
+    finished: usize,
+    statuses: usize,
+}
+impl crate::sink::device_policy_manager::DevicePolicyManager for SinkAlertRecorder {
+    fn status(&self) -> Option<[u8; 7]> {
+        Some([0, 2, 0, 0, 0, 0, 0])
+    }
+    async fn status_sent(&mut self, block: [u8; 7]) {
+        std::assert_eq!(block, [0, 2, 0, 0, 0, 0, 0]);
+        self.statuses += 1;
+    }
+    async fn sink_alert_sent(&mut self, _ado: u32) {
+        self.sent += 1;
+    }
+    async fn sink_alert_not_sent(&mut self, _ado: u32) {
+        self.not_sent += 1;
+    }
+    async fn sink_alert_finished(&mut self) {
+        self.finished += 1;
+    }
+    async fn get_event(&mut self, _: &SourceCapabilities) -> crate::sink::device_policy_manager::Event {
+        match self.ask.take() {
+            Some(ado) => crate::sink::device_policy_manager::Event::SendSinkAlert(ado),
+            None => core::future::pending().await,
+        }
+    }
+}
+fn sink_alert_engine() -> Sink<DummyDriver<MAX_DATA_MESSAGE_SIZE>, DummyTimer, SinkAlertRecorder> {
+    let mut engine = Sink::new(
+        DummyDriver::new(),
+        SinkAlertRecorder {
+            ask: Some(1 << 29),
+            ..Default::default()
+        },
+    );
+    engine.contract = super::Contract::Explicit;
+    engine.established_request = Some(PPS_CONTRACT);
+    engine.source_capabilities = Some(source_capabilities_fixture());
+    engine.state = State::Ready(PPS_CONTRACT, false);
+    engine
+}
+
+#[tokio::test]
+async fn sink_alert_sends_ado_then_waits_for_get_status_and_reports_snapshot() {
+    let mut engine = sink_alert_engine();
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::SendSinkAlert(..)));
+    simulate_source_control_message(&mut engine, ControlMessageType::GoodCRC, 0);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::WaitForGetStatus(_)));
+    std::assert_eq!(engine.device_policy_manager.sent, 1);
+    std::assert_eq!(
+        &engine.protocol_layer.driver().probe_transmitted_data()[..],
+        &[0x86, 0x10, 0, 0, 0, 0x20]
+    );
+    simulate_source_control_message(&mut engine, ControlMessageType::GetStatus, 1);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::GiveStatus(..)));
+    std::assert_eq!(engine.device_policy_manager.finished, 1);
+    simulate_source_control_message(&mut engine, ControlMessageType::GoodCRC, 1);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::Ready(..)));
+    std::assert_eq!(engine.device_policy_manager.statuses, 1);
+    let mut found = false;
+    while engine.protocol_layer.driver().has_transmitted_data() {
+        let bytes = engine.protocol_layer.driver().probe_transmitted_data();
+        if bytes.len() == 14 {
+            std::assert_eq!(&bytes[..], &[0x82, 0xb2, 7, 0x80, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0]);
+            found = true;
+        }
+    }
+    std::assert!(found);
+}
+
+#[tokio::test]
+async fn deferred_sink_alert_keeps_message_id_and_does_not_clear_event_bits() {
+    let mut engine: Sink<DeferringDriver, DummyTimer, SinkAlertRecorder> = Sink::new(
+        DeferringDriver {
+            defer: 1,
+            tx: std::vec::Vec::new(),
+        },
+        SinkAlertRecorder::default(),
+    );
+    engine.contract = super::Contract::Explicit;
+    engine.state = State::SendSinkAlert(PPS_CONTRACT, 1 << 29);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::Ready(..)));
+    std::assert_eq!(engine.device_policy_manager.sent, 0);
+    std::assert_eq!(engine.device_policy_manager.not_sent, 1);
+    std::assert!(engine.protocol_layer.driver().tx.is_empty());
+    engine.protocol_layer.transmit_sink_alert(1 << 29).await.unwrap();
+    std::assert_eq!((engine.protocol_layer.driver().tx[0][1] >> 1) & 7, 0);
+}
+
+#[tokio::test]
+async fn sink_alert_timeout_is_ready_and_unexpected_reply_is_soft_reset() {
+    for reply in [None, Some(ControlMessageType::GetSinkCap)] {
+        let mut engine = sink_alert_engine();
+        engine.run_step().await.unwrap();
+        simulate_source_control_message(&mut engine, ControlMessageType::GoodCRC, 0);
+        engine.run_step().await.unwrap();
+        if let Some(reply) = reply {
+            simulate_source_control_message(&mut engine, reply, 1);
+        }
+        engine.run_step().await.unwrap();
+        std::assert_eq!(engine.device_policy_manager.finished, 1);
+        std::assert_eq!(engine.device_policy_manager.statuses, 0);
+        if reply.is_some() {
+            std::assert!(matches!(engine.state, State::SendSoftReset));
+        } else {
+            std::assert!(matches!(engine.state, State::Ready(..)));
+        }
+    }
+}
+
+#[tokio::test]
+async fn sink_alert_pd2_and_sink_reserved_events_are_not_sent() {
+    use crate::protocol_layer::message::header::SpecificationRevision;
+    for ado in [0, 1 << 26, 1 << 25, 1 << 31, 1 << 29] {
+        let mut engine = sink_alert_engine();
+        engine.device_policy_manager.ask = Some(ado);
+        if ado == 1 << 29 {
+            engine.protocol_layer = crate::protocol_layer::SinkProtocolLayer::new(
+                DummyDriver::new(),
+                Header::new_template(
+                    crate::DataRole::Ufp,
+                    crate::PowerRole::Sink,
+                    SpecificationRevision::R2_0,
+                ),
+            );
+        }
+        engine.run_step().await.unwrap();
+        std::assert!(matches!(engine.state, State::Ready(..)));
+        std::assert_eq!(engine.device_policy_manager.not_sent, 1);
+        std::assert!(!engine.protocol_layer.driver().has_transmitted_data());
+    }
 }

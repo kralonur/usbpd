@@ -207,7 +207,7 @@ mod tests {
             let message_type = ExtendedMessageType::from(kind);
             let parsed = match Message::from_bytes(&bytes).unwrap().payload {
                 Some(Payload::Extended(extended)) => extended,
-                _ => panic!("extended payload"),
+                _ => std::panic!("extended payload"),
             };
             for extended in [
                 parsed,
@@ -216,11 +216,13 @@ mod tests {
             ] {
                 match (extended, expected) {
                     (Extended::SourceCapabilitiesExtended(got), Some(n)) if kind == 1 => {
-                        assert_eq!(got.as_slice(), &block[..n])
+                        std::assert_eq!(got.as_slice(), &block[..n])
                     }
-                    (Extended::ManufacturerInfo(got), Some(n)) if kind == 7 => assert_eq!(got.as_slice(), &block[..n]),
+                    (Extended::ManufacturerInfo(got), Some(n)) if kind == 7 => {
+                        std::assert_eq!(got.as_slice(), &block[..n])
+                    }
                     (Extended::Unknown, None) => {}
-                    (other, _) => panic!("{kind} {size}: {other:?}"),
+                    (other, _) => std::panic!("{kind} {size}: {other:?}"),
                 }
             }
         }
@@ -230,7 +232,7 @@ mod tests {
     fn get_manufacturer_info_serializes_one_padded_object() {
         let block = Extended::GetManufacturerInfo([0, 0]);
         let mut payload = [0xff; 4];
-        assert_eq!((block.data_size(), block.to_bytes(&mut payload)), (2, 2));
-        assert_eq!(payload[..2], [0, 0]);
+        std::assert_eq!((block.data_size(), block.to_bytes(&mut payload)), (2, 2));
+        std::assert_eq!(payload[..2], [0, 0]);
     }
 }
