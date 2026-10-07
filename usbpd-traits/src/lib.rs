@@ -5,6 +5,10 @@
 #![warn(missing_docs)]
 use core::future::Future;
 
+/// SenderResponseTimer duration in milliseconds (USB PD R3.2 V1.2,
+/// section 7.31.2 and Table 7.9: 27-50 ms).
+pub const SENDER_RESPONSE_MS: u64 = 30;
+
 /// Receive Error.
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -25,6 +29,53 @@ pub enum DriverTxError {
 
     /// Hard Reset received before or during transmission.
     HardReset,
+
+    /// The first Message of a Sink-initiated AMS was not sent: Rp was not
+    /// SinkTxOK, or a SOP Message arrived first and the pending Message was
+    /// Discarded (USB PD R3.2 V1.2 sections 7.2, 7.3). Nothing went on the wire.
+    Deferred,
+
+    /// The Message went on the wire but no GoodCRC arrived after nRetryCount
+    /// retries (section 6.6.9.1). A Protocol Error leading to Soft Reset
+    /// (section 7.1.1), unlike `Discarded`, which may be a local fault.
+    NotAcknowledged,
+}
+
+/// Bounded cable discovery outcome; no automatic retries are requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum CableStatus {
+    /// Identity ACK received.
+    Identity,
+    /// Cable rejected Discover Identity.
+    Nak,
+    /// Cable reported busy; the caller does not retry.
+    Busy,
+    /// Cable did not respond before the deadline.
+    Timeout,
+    /// Inspection ended early without sending: Rp was not SinkTxOK, or a SOP
+    /// Message from the port partner took priority (sections 7.2, 7.3).
+    Deferred,
+}
+
+/// Result of an exclusive, explicit-contract cable discovery handoff.
+/// Normal completion restores the driver's pre-handoff controller configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct CableReport {
+    /// Outcome of the bounded operation.
+    pub status: CableStatus,
+    /// Raw identity objects including VDM header, when a response was received.
+    pub objects: [u32; 7],
+    /// Number of valid objects.
+    pub count: u8,
+    /// Interpreted cable revision code (1=PD2, 2=PD3), not the partner revision.
+    /// Received code 0 is normalized to 1 per PD R3.2 V1.2 Table 6.2.
+    pub revision: u8,
+    /// Next SOP transmit ID after successful partner exchanges.
+    pub next_tx_id: u8,
+    /// Last accepted SOP receive ID; cable IDs must never be stored here.
+    pub last_rx_id: Option<u8>,
 }
 
 /// Driver trait, through which the protocol layer talks to the PHY.
@@ -49,6 +100,37 @@ pub trait Driver {
     /// Transmit a packet.
     fn transmit(&mut self, data: &[u8]) -> impl Future<Output = Result<(), DriverTxError>>;
 
+    /// Milliseconds since the matching GoodCRC of the last successful transmit.
+    /// Auto-retry drivers that finish confirmation after receiving GoodCRC must
+    /// report that elapsed time so SenderResponseTimer is not restarted on return
+    /// (USB PD R3.2 V1.2 section 7.31.2). Other drivers default to zero.
+    fn sender_response_elapsed_ms(&self) -> u64 {
+        0
+    }
+
+    /// Exclusive bounded cable discovery extension. The caller hands over SOP
+    /// message IDs only while Ready and owns no concurrent receive future.
+    /// Implementations must return updated SOP IDs, keep SOP' IDs separate,
+    /// and restore pre-handoff controller configuration before success.
+    /// Errors must not resume normal
+    /// traffic or trigger an automatic discovery retry. Unsupported by default.
+    fn discover_cable(
+        &mut self,
+        _next_tx_id: u8,
+        _last_rx_id: Option<u8>,
+    ) -> impl Future<Output = Result<CableReport, DriverRxError>> {
+        async { Err(DriverRxError::Discarded) }
+    }
+
     /// Transmit a hard reset signal.
     fn transmit_hard_reset(&mut self) -> impl Future<Output = Result<(), DriverTxError>>;
+
+    /// BIST Carrier Mode (USB PD R3.2 V1.2 section 5.4.1): send the BMC carrier,
+    /// stop it within tBISTContMode (30-60 ms, section 7.31.6.2) and reset the PHY
+    /// protocol state for PE_SNK_Transition_to_default without Hard Reset. Returns
+    /// only after the carrier has stopped. `Discarded` means not supported or not
+    /// sent; the default implementation sends nothing.
+    fn transmit_bist_carrier(&mut self) -> impl Future<Output = Result<(), DriverTxError>> {
+        async { Err(DriverTxError::Discarded) }
+    }
 }

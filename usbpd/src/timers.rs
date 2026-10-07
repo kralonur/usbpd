@@ -69,7 +69,7 @@ impl TimerType {
             TimerType::PSSourceOnSpr => TIMER::after_millis(435),
             TimerType::PSTransitionSpr => TIMER::after_millis(500),
             TimerType::PSTransitionEpr => TIMER::after_millis(925),
-            TimerType::SenderResponse => TIMER::after_millis(30),
+            TimerType::SenderResponse => TIMER::after_millis(usbpd_traits::SENDER_RESPONSE_MS),
             TimerType::SinkEPREnter => TIMER::after_millis(500),
             TimerType::SinkEPRKeepAlive => TIMER::after_millis(375),
             TimerType::SinkPPSPeriodic => TIMER::after_millis(5000), // Max. 10 s

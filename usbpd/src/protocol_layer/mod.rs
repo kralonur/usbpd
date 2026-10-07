@@ -21,7 +21,9 @@ use heapless::Vec;
 use message::Message;
 use message::data::{Data, request};
 use message::extended::extended_control::ExtendedControlMessageType;
-use message::header::{ControlMessageType, DataMessageType, ExtendedMessageType, Header, MessageType};
+use message::header::{
+    ControlMessageType, DataMessageType, ExtendedMessageType, Header, MessageType, SpecificationRevision,
+};
 use usbpd_traits::{Driver, DriverRxError, DriverTxError};
 
 use crate::PowerRole;
@@ -54,6 +56,10 @@ pub enum ProtocolError {
     /// Transmission failed after the maximum number of allowed retries.
     #[error("transmit retries (`{0}`) exceeded")]
     TransmitRetriesExceeded(u8),
+    /// The driver did not send the first Message of a Sink-initiated AMS
+    /// (SinkTxNG or a received SOP Message, sections 7.2/7.3). No counters change.
+    #[error("transmit deferred")]
+    TransmitDeferred,
     /// An unexpected message was received.
     #[error("unexpected message")]
     UnexpectedMessage,
@@ -75,6 +81,10 @@ pub enum RxError {
     /// An unsupported message was received.
     #[error("unsupported message")]
     UnsupportedMessage,
+    /// A Chunk of a multi-Chunk Message was received without a Chunking layer.
+    /// Section 7.31.15.1: answer Not_Supported after ChunkingNotSupportedTimer.
+    #[error("multi-chunk message without chunking layer")]
+    ChunkingNotSupported,
     /// A message parsing error occured.
     #[error("parse error")]
     ParseError(#[from] ParseError),
@@ -127,6 +137,9 @@ pub(crate) struct ProtocolLayer<DRIVER: Driver, TIMER: Timer> {
     driver: DRIVER,
     counters: Counters,
     default_header: Header,
+    supported_revision: SpecificationRevision,
+    revision_locked: bool,
+    chunking: bool,
     extended_rx_buffer: Vec<u8, MAX_MESSAGE_SIZE>,
     extended_rx_expected: Option<(ExtendedMessageType, u16, u8)>,
     _timer: PhantomData<TIMER>,
@@ -139,15 +152,74 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
             driver,
             counters: Default::default(),
             default_header,
+            supported_revision: default_header.spec_revision().expect("valid initial header"),
+            revision_locked: false,
+            chunking: true,
             extended_rx_buffer: Vec::new(),
             extended_rx_expected: None,
             _timer: PhantomData,
         }
     }
 
+    /// Exclusive explicit-contract extension; no RX future is active here.
+    /// The driver returns only after normal ownership transfer has completed.
+    pub async fn discover_cable(&mut self) -> Result<usbpd_traits::CableReport, ProtocolError> {
+        let report = self
+            .driver
+            .discover_cable(
+                self.counters.tx_message.value(),
+                self.counters.rx_message.as_ref().map(|counter| counter.value()),
+            )
+            .await
+            .map_err(|error| match error {
+                DriverRxError::Discarded => RxError::ReceiveTimeout,
+                DriverRxError::HardReset => RxError::HardReset,
+            })?;
+        self.counters.tx_message.set(report.next_tx_id);
+        self.counters.rx_message = report.last_rx_id.map(|id| {
+            let mut counter = Counter::new(CounterType::MessageId);
+            counter.set(id);
+            counter
+        });
+        Ok(report)
+    }
+
+    /// Select whether multi-Chunk Messages are assembled (the default). A port
+    /// without a Chunking layer acknowledges and reports them instead, so the
+    /// policy engine can apply section 7.31.15.1 (section 9.2.7).
+    pub fn set_chunking(&mut self, chunking: bool) {
+        self.chunking = chunking;
+        self.reset_chunked_rx();
+    }
+
     /// Reset the protocol layer.
     pub fn reset(&mut self) {
         self.counters = Default::default();
+    }
+
+    // Soft_Reset only resets counters. Revision detection restarts at a
+    // Hard Reset (or a new ProtocolLayer after detach/error recovery).
+    fn reset_revision(&mut self) {
+        self.revision_locked = false;
+        self.default_header.set_spec_revision(self.supported_revision);
+    }
+
+    fn detect_revision(&mut self, header: Header) -> Result<(), RxError> {
+        if self.revision_locked {
+            return Ok(());
+        }
+        let source_request = matches!(self.default_header.port_power_role(), PowerRole::Source)
+            && header.message_type() == MessageType::Data(DataMessageType::Request);
+        let sink_capabilities = matches!(self.default_header.port_power_role(), PowerRole::Sink)
+            && header.message_type() == MessageType::Data(DataMessageType::SourceCapabilities);
+        if source_request || sink_capabilities {
+            let supported = u8::from(self.supported_revision).max(1);
+            let peer = u8::from(header.spec_revision()?).max(1);
+            self.default_header
+                .set_spec_revision(SpecificationRevision::try_from(supported.min(peer))?);
+            self.revision_locked = source_request;
+        }
+        Ok(())
     }
 
     /// Allows tests to access the driver directly.
@@ -186,7 +258,10 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
             let length = match self.driver.receive(&mut buffer).await {
                 Ok(length) => length,
                 Err(DriverRxError::Discarded) => continue,
-                Err(DriverRxError::HardReset) => return Err(RxError::HardReset),
+                Err(DriverRxError::HardReset) => {
+                    self.reset_revision();
+                    return Err(RxError::HardReset);
+                }
             };
 
             let message = Message::from_bytes(&buffer[..length])?;
@@ -282,7 +357,8 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
             match self.driver.transmit(buffer).await {
                 Ok(_) => return Ok(()),
                 Err(DriverTxError::HardReset) => return Err(TxError::HardReset),
-                Err(DriverTxError::Discarded) => {
+                // Software-retry drivers re-offer a deferred Message like a discarded one.
+                Err(DriverTxError::Discarded | DriverTxError::Deferred | DriverTxError::NotAcknowledged) => {
                     // Retry transmission.
                 }
             }
@@ -294,6 +370,11 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
     // GoodCrc message transmission is handled separately.
     // See `transmit_good_crc()` instead.
     pub async fn transmit(&mut self, message: Message) -> Result<(), ProtocolError> {
+        if matches!(self.default_header.port_power_role(), PowerRole::Sink)
+            && message.header.message_type() == MessageType::Data(DataMessageType::Request)
+        {
+            self.revision_locked = true;
+        }
         assert_ne!(
             message.header.message_type(),
             MessageType::Control(ControlMessageType::GoodCRC)
@@ -320,7 +401,8 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
                     Ok(())
                 }
                 Err(DriverTxError::HardReset) => Err(TxError::HardReset.into()),
-                Err(DriverTxError::Discarded) => {
+                Err(DriverTxError::Deferred) => Err(ProtocolError::TransmitDeferred),
+                Err(DriverTxError::Discarded | DriverTxError::NotAcknowledged) => {
                     Err(ProtocolError::TransmitRetriesExceeded(self.counters.retry.max_value()))
                 }
             }
@@ -352,7 +434,7 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
     }
 
     /// Send a GoodCrc message to the port partner.
-    async fn transmit_good_crc(&mut self) -> Result<(), ProtocolError> {
+    async fn transmit_good_crc(&mut self, revision: SpecificationRevision) -> Result<(), ProtocolError> {
         trace!(
             "Transmit message GoodCrc for RX message count: {}",
             self.counters.rx_message.unwrap().value()
@@ -361,7 +443,7 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
         let mut buffer = Self::get_message_buffer();
 
         let size = Message::new(Header::new_control(
-            self.default_header,
+            self.default_header.with_spec_revision(revision),
             self.counters.rx_message.unwrap(), // A message must have been received before.
             ControlMessageType::GoodCRC,
         ))
@@ -387,7 +469,15 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
         };
 
         if !DRIVER::HAS_AUTO_GOOD_CRC && !is_good_crc {
-            match self.transmit_good_crc().await {
+            let revision = if matches!(
+                message.header.spec_revision()?,
+                SpecificationRevision::R1_0 | SpecificationRevision::R2_0
+            ) {
+                SpecificationRevision::R2_0
+            } else {
+                SpecificationRevision::R3_X
+            };
+            match self.transmit_good_crc(revision).await {
                 Ok(()) => {}
                 Err(ProtocolError::TxError(TxError::HardReset)) => return Err(RxError::HardReset),
                 Err(_) => return Err(RxError::UnsupportedMessage),
@@ -411,7 +501,10 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
             let length = match self.driver.receive(&mut buffer).await {
                 Ok(length) => length,
                 Err(DriverRxError::Discarded) => continue,
-                Err(DriverRxError::HardReset) => return Err(RxError::HardReset),
+                Err(DriverRxError::HardReset) => {
+                    self.reset_revision();
+                    return Err(RxError::HardReset);
+                }
             };
 
             // Parse header early to handle chunking.
@@ -431,9 +524,6 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
                     _ => unreachable!(),
                 };
 
-                // Update specification revision, based on the received frame.
-                self.default_header = self.default_header.with_spec_revision(header.spec_revision()?);
-
                 if chunked {
                     trace!(
                         "Received chunked extended message {:?}, chunk {}, size {}",
@@ -446,6 +536,19 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
                     let tmp_message = Message { header, payload: None };
                     if self.handle_rx_ack(&tmp_message).await? {
                         continue; // Retransmission
+                    }
+                    // Table 6.48: Chunk Number 10..15 is Invalid; ignore the Message.
+                    if chunk_number > 9 {
+                        continue;
+                    }
+                    if !self.chunking {
+                        // A stray Chunk request is not part of a received multi-Chunk Message.
+                        if ext_header.request_chunk() {
+                            return Err(RxError::UnsupportedMessage);
+                        }
+                        if chunk_number > 0 || payload.len() < total_size as usize {
+                            return Err(RxError::ChunkingNotSupported);
+                        }
                     }
 
                     let (expected_total, expected_next) = match self.extended_rx_expected {
@@ -489,7 +592,7 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
                     // All chunks received, parse payload.
                     let ext_payload = &self.extended_rx_buffer[..total_size as usize];
                     let parsed_payload = match msg_type {
-                        ExtendedMessageType::ExtendedControl => {
+                        ExtendedMessageType::ExtendedControl if ext_payload.len() >= 2 => {
                             Payload::Extended(message::extended::Extended::ExtendedControl(
                                 message::extended::extended_control::ExtendedControl::from_bytes(ext_payload),
                             ))
@@ -504,7 +607,19 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
                                     .collect(),
                             ))
                         }
-                        _ => Payload::Extended(message::extended::Extended::Unknown),
+                        // Table 6.58: the PPSSDB is exactly 4 bytes.
+                        ExtendedMessageType::PpsStatus if ext_payload.len() == 4 => {
+                            Payload::Extended(message::extended::Extended::PpsStatus([
+                                ext_payload[0],
+                                ext_payload[1],
+                                ext_payload[2],
+                                ext_payload[3],
+                            ]))
+                        }
+                        _ => Payload::Extended(
+                            message::extended::Extended::information(msg_type, ext_payload)
+                                .unwrap_or(message::extended::Extended::Unknown),
+                        ),
                     };
 
                     self.extended_rx_expected = None;
@@ -519,21 +634,31 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
             // Non-extended or unchunked extended messages.
             let message = Message::from_bytes(&buffer[..length])?;
 
-            // Update specification revision, based on the received frame.
-            self.default_header = self.default_header.with_spec_revision(message.header.spec_revision()?);
-
-            match message.header.message_type() {
-                MessageType::Control(ControlMessageType::Reserved) | MessageType::Data(DataMessageType::Reserved) => {
-                    trace!("Unsupported message type in header: {:?}", message.header);
-                    return Err(RxError::UnsupportedMessage);
+            if message.header.message_type() == MessageType::Control(ControlMessageType::SoftReset) {
+                // Sections 9.2.5.2.2 / 6.1.3.1: Accept a startup reset at the
+                // peer's supported revision, without locking the first Request's
+                // revision detection or changing an already negotiated revision.
+                if !self.revision_locked {
+                    let peer = u8::from(message.header.spec_revision()?).max(1);
+                    let supported = u8::from(self.supported_revision).max(1);
+                    self.default_header
+                        .set_spec_revision(SpecificationRevision::try_from(supported.min(peer))?);
                 }
-                MessageType::Control(ControlMessageType::SoftReset) => return Err(RxError::SoftReset),
-                _ => (),
+                return Err(RxError::SoftReset);
             }
 
-            // Handle GoodCRC and retransmissions.
+            // Acknowledge/deduplicate even reserved types before responding as
+            // unsupported. A retransmission must not trigger another reply.
             if self.handle_rx_ack(&message).await? {
                 continue; // Retransmission
+            }
+            self.detect_revision(message.header)?;
+            if matches!(
+                message.header.message_type(),
+                MessageType::Control(ControlMessageType::Reserved) | MessageType::Data(DataMessageType::Reserved)
+            ) {
+                trace!("Unsupported message type in header: {:?}", message.header);
+                return Err(RxError::UnsupportedMessage);
             }
 
             trace!("Received message {:?}", message);
@@ -589,7 +714,16 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
             assert_ne!(*message_type, MessageType::Control(ControlMessageType::GoodCRC));
         }
 
-        let timeout_fut = Self::get_timer(timer_type);
+        // Section 7.31.2: GoodCRC reception, not delayed driver confirmation,
+        // starts SenderResponseTimer. Keep all other timer origins unchanged.
+        let elapsed = self.driver.sender_response_elapsed_ms();
+        let timeout_fut = async move {
+            if matches!(timer_type, TimerType::SenderResponse) {
+                TIMER::after_millis(usbpd_traits::SENDER_RESPONSE_MS.saturating_sub(elapsed)).await;
+            } else {
+                Self::get_timer(timer_type).await;
+            }
+        };
         let receive_fut = async {
             loop {
                 match self.receive_message_inner().await {
@@ -628,12 +762,23 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
         loop {
             match self.driver.transmit_hard_reset().await {
                 Ok(_) | Err(DriverTxError::HardReset) => break,
-                Err(DriverTxError::Discarded) => (),
+                Err(DriverTxError::Discarded | DriverTxError::Deferred | DriverTxError::NotAcknowledged) => (),
             }
         }
 
+        self.reset_revision();
         trace!("Performed hard reset");
         Ok(())
+    }
+
+    /// BIST Carrier Mode through the driver (section 5.4.1). `Ok(false)`: the
+    /// driver does not support it and sent nothing.
+    pub async fn transmit_bist_carrier(&mut self) -> Result<bool, ProtocolError> {
+        match self.driver.transmit_bist_carrier().await {
+            Ok(()) => Ok(true),
+            Err(DriverTxError::HardReset) => Err(TxError::HardReset.into()),
+            Err(DriverTxError::Discarded | DriverTxError::Deferred | DriverTxError::NotAcknowledged) => Ok(false),
+        }
     }
 
     /// Wait for VBUS to be available.
@@ -730,7 +875,9 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
                     Ok(())
                 }
                 Err(DriverTxError::HardReset) => Err(RxError::HardReset),
-                Err(DriverTxError::Discarded) => Err(RxError::ReceiveTimeout),
+                Err(DriverTxError::Discarded | DriverTxError::Deferred | DriverTxError::NotAcknowledged) => {
+                    Err(RxError::ReceiveTimeout)
+                }
             }
         } else {
             match self.transmit_inner(&buffer[..offset]).await {
@@ -741,6 +888,72 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
                 }
             }
         }
+    }
+
+    /// Transmit a Revision Message (section 6.4.11) in response to Get_Revision.
+    pub async fn transmit_revision(&mut self, revision_data_object: u32) -> Result<(), ProtocolError> {
+        let header = Header::new_data(
+            self.default_header,
+            self.counters.tx_message,
+            DataMessageType::Revision,
+            1,
+        );
+        self.transmit(Message::new_with_data(header, Data::Revision(revision_data_object)))
+            .await
+    }
+
+    /// Transmit Sink_Capabilities_Extended (section 6.5.16) in response to
+    /// Get_Sink_Cap_Extended. Sinks here never set Unchunked Extended Messages
+    /// Supported, so section 6.5.1.1 (Table 6.49) requires Chunked. The 24-byte
+    /// SKEDB is a single Chunk 0 (no Chunking layer): 2 + 24 bytes padded with
+    /// 00h to 7 Data Objects (Table 6.48).
+    pub async fn transmit_sink_capabilities_extended(&mut self, block: [u8; 24]) -> Result<(), ProtocolError> {
+        let header = Header::new_extended(
+            self.default_header,
+            self.counters.tx_message,
+            ExtendedMessageType::SinkCapabilitiesExtended,
+            7,
+        );
+        let mut message = Message::new(header);
+        message.payload = Some(Payload::Extended(Extended::SinkCapabilitiesExtended(block)));
+        self.transmit(message).await
+    }
+
+    /// Sink Alert: one ADO (sections 6.4.5, 9.2.8.3.1).
+    pub async fn transmit_sink_alert(&mut self, ado: u32) -> Result<(), ProtocolError> {
+        let header = Header::new_data(self.default_header, self.counters.tx_message, DataMessageType::Alert, 1);
+        self.transmit(Message::new_with_data(header, Data::Alert(ado))).await
+    }
+
+    /// SOP Status: Chunked Chunk 0, seven bytes padded to three Data Objects
+    /// (Tables 6.48, 6.51). No multi-Chunk assembly is needed.
+    pub async fn transmit_status(&mut self, block: [u8; 7]) -> Result<(), ProtocolError> {
+        let header = Header::new_extended(
+            self.default_header,
+            self.counters.tx_message,
+            ExtendedMessageType::Status,
+            3,
+        );
+        let mut message = Message::new(header);
+        message.payload = Some(Payload::Extended(Extended::Status(
+            heapless::Vec::from_slice(&block).expect("7 bytes"),
+        )));
+        self.transmit(message).await
+    }
+
+    /// Transmit Get_Manufacturer_Info (section 6.5.7) for the Port (Target 0,
+    /// Ref Reserved 0, Table 6.56): Chunked Chunk 0 of 2 bytes in one Data
+    /// Object (Table 6.48; Sinks never set Unchunked Extended Messages Supported).
+    pub async fn transmit_get_manufacturer_info(&mut self) -> Result<(), ProtocolError> {
+        let header = Header::new_extended(
+            self.default_header,
+            self.counters.tx_message,
+            ExtendedMessageType::GetManufacturerInfo,
+            1,
+        );
+        let mut message = Message::new(header);
+        message.payload = Some(Payload::Extended(Extended::GetManufacturerInfo([0, 0])));
+        self.transmit(message).await
     }
 
     /// Transmit sink capabilities in response to Get_Sink_Cap.
@@ -965,6 +1178,152 @@ mod tests {
                 super::message::header::SpecificationRevision::R3_X,
             ),
         )
+    }
+
+    #[tokio::test]
+    async fn revision_lock_survives_soft_reset_but_not_hard_reset() {
+        use super::message::header::{ControlMessageType, DataMessageType, SpecificationRevision};
+        let mut protocol = get_protocol_layer();
+        let mut caps = DUMMY_CAPABILITIES;
+        caps[0] = (caps[0] & !0xc0) | 0x40;
+        protocol.driver.inject_received_data(&caps);
+        protocol.receive_message().await.unwrap();
+        assert_eq!(protocol.driver.probe_transmitted_data()[0] & 0xc0, 0x40); // software GoodCRC
+        protocol.driver.inject_received_data(&[0x61, 0x01]); // Request ID0 ACK
+        let header = Header::new_data(
+            *protocol.header(),
+            protocol.counters.tx_message,
+            DataMessageType::Request,
+            1,
+        );
+        let request = super::message::Message::new_with_data(
+            header,
+            Data::Request(super::request::PowerSource::FixedVariableSupply(
+                super::request::FixedVariableSupply(0x1100_280a),
+            )),
+        );
+        protocol.transmit(request).await.unwrap();
+        protocol.driver.probe_transmitted_data();
+        protocol.driver.inject_received_data(&[0x8d, 0x01]);
+        assert!(matches!(
+            protocol.receive_message().await,
+            Err(super::ProtocolError::RxError(super::RxError::SoftReset))
+        ));
+        assert_eq!(protocol.header().0 & 0xc0, 0x40); // locked revision never changes
+        protocol.reset(); // Soft_Reset counter boundary, not revision boundary
+        assert!(protocol.revision_locked);
+        for chunked in [false, true] {
+            // Single-chunk extended frame with four bytes of opaque payload.
+            protocol.driver.inject_received_data(&[
+                0xa2,
+                if chunked { 0xa3 } else { 0xa1 },
+                4,
+                if chunked { 0x80 } else { 0 },
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]);
+            protocol.receive_message().await.unwrap();
+            assert_eq!(protocol.driver.probe_transmitted_data()[0] & 0xc0, 0x80);
+            assert_eq!(protocol.header().0 & 0xc0, 0x40); // ACK revision does not renegotiate SOP
+        }
+        protocol.driver.inject_received_data(&[0x81, 0x00]); // GoodCRC ID0 after counter reset
+        protocol
+            .transmit_control_message(ControlMessageType::Accept)
+            .await
+            .unwrap();
+        assert_eq!(protocol.driver.probe_transmitted_data()[0] & 0xc0, 0x40);
+        protocol.hard_reset().await.unwrap(); // dummy driver only; no physical signaling
+        assert!(!protocol.revision_locked);
+        protocol
+            .detect_revision(
+                header
+                    .with_spec_revision(SpecificationRevision::R3_X)
+                    .with_message_type_raw(DataMessageType::SourceCapabilities as u8),
+            )
+            .unwrap();
+        assert_eq!(protocol.header().0 & 0xc0, 0x80);
+    }
+
+    #[test]
+    fn source_revision_detection_is_bounded_by_supported_revision() {
+        use super::message::header::{DataMessageType, SpecificationRevision};
+        let header = Header::new_template(
+            crate::DataRole::Dfp,
+            crate::PowerRole::Source,
+            SpecificationRevision::R2_0,
+        );
+        let mut protocol: ProtocolLayer<DummyDriver<MAX_DATA_MESSAGE_SIZE>, DummyTimer> =
+            ProtocolLayer::new(DummyDriver::new(), header);
+        protocol
+            .detect_revision(
+                header
+                    .with_spec_revision(SpecificationRevision::R3_X)
+                    .with_num_objects(1)
+                    .with_message_type_raw(DataMessageType::Request as u8),
+            )
+            .unwrap();
+        assert!(protocol.revision_locked);
+        assert_eq!(protocol.header().0 & 0xc0, 0x40);
+        protocol.reset();
+        assert!(protocol.revision_locked);
+    }
+
+    #[tokio::test]
+    async fn sender_response_uses_time_remaining_since_goodcrc() {
+        use usbpd_traits::{Driver, DriverRxError, DriverTxError};
+
+        use super::message::header::ControlMessageType;
+        use crate::timers::{Timer, TimerType};
+        std::thread_local! {
+            static REQUESTED_MS: core::cell::Cell<u64> = const { core::cell::Cell::new(u64::MAX) };
+        }
+        struct ElapsedDriver(u64);
+        impl Driver for ElapsedDriver {
+            async fn wait_for_vbus(&mut self) {}
+            async fn receive(&mut self, _: &mut [u8]) -> Result<usize, DriverRxError> {
+                core::future::pending().await
+            }
+            async fn transmit(&mut self, _: &[u8]) -> Result<(), DriverTxError> {
+                Ok(())
+            }
+            async fn transmit_hard_reset(&mut self) -> Result<(), DriverTxError> {
+                Ok(())
+            }
+            fn sender_response_elapsed_ms(&self) -> u64 {
+                self.0
+            }
+        }
+        struct RecordingTimer;
+        impl Timer for RecordingTimer {
+            async fn after_millis(ms: u64) {
+                REQUESTED_MS.with(|value| value.set(ms));
+            }
+        }
+        for (timer, elapsed, remaining) in [
+            (TimerType::SenderResponse, 0, 30),
+            (TimerType::SenderResponse, 15, 15),
+            (TimerType::SenderResponse, 29, 1),
+            (TimerType::SenderResponse, 30, 0),
+            (TimerType::SenderResponse, 45, 0),
+            (TimerType::SinkWaitCap, 15, 465),
+        ] {
+            let mut protocol =
+                ProtocolLayer::<_, RecordingTimer>::new(ElapsedDriver(elapsed), *get_protocol_layer().header());
+            assert!(matches!(
+                protocol
+                    .receive_message_type(
+                        &[super::message::header::MessageType::Control(ControlMessageType::Accept)],
+                        timer,
+                    )
+                    .await,
+                Err(super::ProtocolError::RxError(super::RxError::ReceiveTimeout))
+            ));
+            REQUESTED_MS.with(|value| assert_eq!(value.get(), remaining));
+        }
     }
 
     #[tokio::test]

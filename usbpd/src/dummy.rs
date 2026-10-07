@@ -234,6 +234,9 @@ impl Timer for DummyTimer {
 pub struct DummyDriver<const N: usize> {
     rx_vec: Vec<heapless::Vec<u8, N>>,
     tx_vec: Vec<heapless::Vec<u8, N>>,
+    /// Supports BIST Carrier Mode; counts carriers sent.
+    pub bist_carrier: bool,
+    pub bist_carriers: usize,
 }
 
 impl<const N: usize> Default for DummyDriver<N> {
@@ -241,6 +244,8 @@ impl<const N: usize> Default for DummyDriver<N> {
         Self {
             rx_vec: Vec::new(),
             tx_vec: Vec::new(),
+            bist_carrier: false,
+            bist_carriers: 0,
         }
     }
 }
@@ -300,6 +305,14 @@ impl<const N: usize> Driver for DummyDriver<N> {
 
     async fn wait_for_vbus(&mut self) {
         // Do nothing.
+    }
+
+    async fn transmit_bist_carrier(&mut self) -> Result<(), usbpd_traits::DriverTxError> {
+        if !self.bist_carrier {
+            return Err(usbpd_traits::DriverTxError::Discarded);
+        }
+        self.bist_carriers += 1;
+        Ok(())
     }
 }
 
