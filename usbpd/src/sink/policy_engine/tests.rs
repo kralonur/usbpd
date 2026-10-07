@@ -1123,6 +1123,7 @@ async fn startup_soft_reset_uses_peer_revision_without_locking_capability_detect
         );
         engine.run_step().await.unwrap();
         std::assert!(matches!(engine.state, State::SoftReset));
+        std::assert_eq!(transmitted(&mut engine), [GOOD_CRC]);
         simulate_source_control_message(&mut engine, ControlMessageType::GoodCRC, 0);
         engine.run_step().await.unwrap();
         std::assert!(matches!(engine.state, State::WaitForCapabilities));

@@ -17,7 +17,7 @@ use core::marker::PhantomData;
 
 use byteorder::{ByteOrder, LittleEndian};
 use embassy_futures::select::{Either, select};
-use heapless::Vec;
+use heapless::{Deque, Vec};
 use message::Message;
 use message::data::{Data, request};
 use message::extended::extended_control::ExtendedControlMessageType;
@@ -142,6 +142,7 @@ pub(crate) struct ProtocolLayer<DRIVER: Driver, TIMER: Timer> {
     chunking: bool,
     extended_rx_buffer: Vec<u8, MAX_MESSAGE_SIZE>,
     extended_rx_expected: Option<(ExtendedMessageType, u16, u8)>,
+    pending_rx: Deque<Message, 2>,
     _timer: PhantomData<TIMER>,
 }
 
@@ -157,6 +158,7 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
             chunking: true,
             extended_rx_buffer: Vec::new(),
             extended_rx_expected: None,
+            pending_rx: Deque::new(),
             _timer: PhantomData,
         }
     }
@@ -195,9 +197,11 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
     /// Reset the protocol layer.
     pub fn reset(&mut self) {
         self.counters = Default::default();
+        self.pending_rx.clear();
+        self.reset_chunked_rx();
     }
 
-    // Soft_Reset only resets counters. Revision detection restarts at a
+    // Soft_Reset clears protocol state but preserves the negotiated revision. Revision detection restarts at a
     // Hard Reset (or a new ProtocolLayer after detach/error recovery).
     fn reset_revision(&mut self) {
         self.revision_locked = false;
@@ -275,29 +279,35 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
 
         let timeout_fut = Self::get_timer(TimerType::CRCReceive);
         let receive_fut = async {
-            let message = self.receive_simple().await?;
-
-            if matches!(
-                message.header.message_type(),
-                MessageType::Control(ControlMessageType::GoodCRC)
-            ) {
-                trace!(
-                    "Received GoodCrc, TX message count: {}, expected: {}",
-                    message.header.message_id(),
-                    self.counters.tx_message.value()
-                );
-                if message.header.message_id() == self.counters.tx_message.value() {
-                    // See spec, [6.7.1.1]
+            loop {
+                let message = match self.receive_simple().await {
+                    Err(RxError::ParseError(error)) => {
+                        trace!("Dropping frame with parse error: {:?}", error);
+                        continue;
+                    }
+                    result => result?,
+                };
+                if message.header.message_type() == MessageType::Control(ControlMessageType::GoodCRC) {
+                    if message.header.message_id() != self.counters.tx_message.value() {
+                        return Err(RxError::AcknowledgeMismatch(message.header.message_id()));
+                    }
                     self.counters.retry.reset();
                     _ = self.counters.tx_message.increment();
-                    Ok(())
-                } else {
-                    Err(RxError::AcknowledgeMismatch(message.header.message_id()))
+                    return Ok(());
                 }
-            } else if matches!(message.header.message_type(), MessageType::Control(_)) {
-                Err(ParseError::InvalidControlMessageType(message.header.message_type_raw()).into())
-            } else {
-                Err(ParseError::InvalidMessageType(message.header.message_type_raw()).into())
+                if message.header.message_type() == MessageType::Control(ControlMessageType::SoftReset) {
+                    self.handle_soft_reset(&message).await?;
+                    return Err(RxError::SoftReset);
+                }
+                // The receive state machine remains active while waiting for GoodCRC.
+                // Acknowledge and park complete messages; do not park duplicates.
+                if !self.handle_rx_ack(&message).await? {
+                    if self.pending_rx.is_full() {
+                        _ = self.pending_rx.pop_front();
+                        warn!("Pending received-message queue full, dropping oldest message");
+                    }
+                    _ = self.pending_rx.push_back(message);
+                }
             }
         };
 
@@ -305,6 +315,19 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
             Either::First(_) => Err(RxError::ReceiveTimeout),
             Either::Second(receive_result) => receive_result,
         }
+    }
+
+    /// Reset receive state before acknowledging Soft_Reset, preserving revision negotiation.
+    async fn handle_soft_reset(&mut self, message: &Message) -> Result<(), RxError> {
+        if !self.revision_locked {
+            let peer = u8::from(message.header.spec_revision()?).max(1);
+            let supported = u8::from(self.supported_revision).max(1);
+            self.default_header
+                .set_spec_revision(SpecificationRevision::try_from(supported.min(peer))?);
+        }
+        self.reset();
+        self.handle_rx_ack(message).await?;
+        Ok(())
     }
 
     /// Validate an outgoing message for spec compliance.
@@ -337,9 +360,13 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
                         return Err(TxError::UnchunkedExtendedMessagesNotSupported);
                     }
 
-                    // Check if this looks like an AVS request (bits 30-31 = 00, bits 28-29 = 11)
-                    let is_avs = ((rdo_bits >> 30) & 0x3 == 0) && ((rdo_bits >> 28) & 0x3 == 3);
-                    if is_avs {
+                    // The requested PDO identifies the RDO format, not the object position bits.
+                    if matches!(
+                        epr.pdo,
+                        message::data::source_capabilities::PowerDataObject::Augmented(
+                            message::data::source_capabilities::Augmented::Epr(_)
+                        )
+                    ) {
                         let voltage = (rdo_bits >> 9) & 0xFFF;
                         if (voltage as u16) & 0x3 != 0 {
                             return Err(TxError::AvsVoltageAlignmentInvalid);
@@ -403,6 +430,8 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
                 Err(DriverTxError::HardReset) => Err(TxError::HardReset.into()),
                 Err(DriverTxError::Deferred) => Err(ProtocolError::TransmitDeferred),
                 Err(DriverTxError::Discarded | DriverTxError::NotAcknowledged) => {
+                    // PRL_Tx_Transmission_Error advances the ID; an unsent deferral above does not.
+                    _ = self.counters.tx_message.increment();
                     Err(ProtocolError::TransmitRetriesExceeded(self.counters.retry.max_value()))
                 }
             }
@@ -417,14 +446,19 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
                             trace!("Transmit success");
                             return Ok(());
                         }
-                        Err(RxError::ReceiveTimeout) => match self.counters.retry.increment() {
-                            Ok(_) => {
-                                // Retry transmission, until the retry counter is exceeded.
+                        Err(RxError::ReceiveTimeout | RxError::AcknowledgeMismatch(_)) => {
+                            match self.counters.retry.increment() {
+                                Ok(_) => {
+                                    // Retry transmission, until the retry counter is exceeded.
+                                }
+                                Err(CounterError::Exceeded) => {
+                                    _ = self.counters.tx_message.increment();
+                                    return Err(ProtocolError::TransmitRetriesExceeded(
+                                        self.counters.retry.max_value(),
+                                    ));
+                                }
                             }
-                            Err(CounterError::Exceeded) => {
-                                return Err(ProtocolError::TransmitRetriesExceeded(self.counters.retry.max_value()));
-                            }
-                        },
+                        }
                         Err(other) => return Err(other.into()),
                     },
                     Err(other) => return Err(other.into()),
@@ -496,6 +530,17 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
     /// Receive a message, assembling chunked extended messages as needed.
     async fn receive_message_inner(&mut self) -> Result<Message, RxError> {
         loop {
+            if let Some(message) = self.pending_rx.pop_front() {
+                // Already acknowledged and deduplicated; only apply post-receive checks.
+                self.detect_revision(message.header)?;
+                if matches!(
+                    message.header.message_type(),
+                    MessageType::Control(ControlMessageType::Reserved) | MessageType::Data(DataMessageType::Reserved)
+                ) {
+                    return Err(RxError::UnsupportedMessage);
+                }
+                return Ok(message);
+            }
             let mut buffer = Self::get_message_buffer();
 
             let length = match self.driver.receive(&mut buffer).await {
@@ -508,11 +553,18 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
             };
 
             // Parse header early to handle chunking.
-            let header = Header::from_bytes(&buffer[..MSG_HEADER_SIZE])?;
+            let header = Header::from_bytes(&buffer[..length.min(MSG_HEADER_SIZE)])?;
             let message_type = header.message_type();
 
             if matches!(message_type, MessageType::Extended(_)) {
                 let ext_header_end = MSG_HEADER_SIZE + EXT_HEADER_SIZE;
+                if length < ext_header_end {
+                    return Err(ParseError::InvalidLength {
+                        expected: ext_header_end,
+                        found: length,
+                    }
+                    .into());
+                }
                 let ext_header =
                     message::extended::ExtendedHeader::from_bytes(&buffer[MSG_HEADER_SIZE..ext_header_end]);
                 let payload = &buffer[ext_header_end..length];
@@ -635,15 +687,7 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
             let message = Message::from_bytes(&buffer[..length])?;
 
             if message.header.message_type() == MessageType::Control(ControlMessageType::SoftReset) {
-                // Sections 9.2.5.2.2 / 6.1.3.1: Accept a startup reset at the
-                // peer's supported revision, without locking the first Request's
-                // revision detection or changing an already negotiated revision.
-                if !self.revision_locked {
-                    let peer = u8::from(message.header.spec_revision()?).max(1);
-                    let supported = u8::from(self.supported_revision).max(1);
-                    self.default_header
-                        .set_spec_revision(SpecificationRevision::try_from(supported.min(peer))?);
-                }
+                self.handle_soft_reset(&message).await?;
                 return Err(RxError::SoftReset);
             }
 
@@ -740,7 +784,10 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
                             Err(ProtocolError::UnexpectedMessage)
                         };
                     }
-                    Err(RxError::ParseError(_)) => unreachable!(),
+                    Err(RxError::ParseError(error)) => {
+                        trace!("Dropping frame with parse error: {:?}", error);
+                        continue;
+                    }
                     Err(other) => return Err(other.into()),
                 }
             }
@@ -756,8 +803,7 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
     ///
     // See spec, [6.7.1.1]
     pub async fn hard_reset(&mut self) -> Result<(), ProtocolError> {
-        self.counters.tx_message.reset();
-        self.counters.retry.reset();
+        self.reset();
 
         loop {
             match self.driver.transmit_hard_reset().await {
@@ -1156,6 +1202,9 @@ impl<DRIVER: Driver, TIMER: Timer> SourceProtocolLayer<DRIVER, TIMER> {
 }
 
 #[cfg(test)]
+mod backport_tests;
+
+#[cfg(test)]
 mod tests {
 
     use core::iter::zip;
@@ -1209,6 +1258,7 @@ mod tests {
             protocol.receive_message().await,
             Err(super::ProtocolError::RxError(super::RxError::SoftReset))
         ));
+        assert_eq!(protocol.driver.probe_transmitted_data()[0] & 0xc0, 0x80); // GoodCRC for Soft_Reset
         assert_eq!(protocol.header().0 & 0xc0, 0x40); // locked revision never changes
         protocol.reset(); // Soft_Reset counter boundary, not revision boundary
         assert!(protocol.revision_locked);
