@@ -90,6 +90,30 @@ async fn run_test_step<DPM: SourceDpm>(
 }
 
 #[tokio::test]
+async fn reserved_extended_control_is_unsupported_without_panicking() {
+    use crate::protocol_layer::message::Payload;
+    use crate::protocol_layer::message::extended::Extended;
+    use crate::protocol_layer::message::extended::extended_control::ExtendedControl;
+    use crate::protocol_layer::message::header::ExtendedMessageType;
+    let mut engine =
+        Source::<_, DummyTimer, _>::new(DummyDriver::<MAX_DATA_MESSAGE_SIZE>::new(), DummySourceDevice, false);
+    for kind in [0, 5, 255] {
+        let header = Header::new_extended(
+            get_sink_header_template(),
+            Counter::new(CounterType::MessageId),
+            ExtendedMessageType::ExtendedControl,
+            1,
+        );
+        let mut message = Message::new(header);
+        message.payload = Some(Payload::Extended(Extended::ExtendedControl(ExtendedControl(kind))));
+        std::assert!(matches!(
+            engine.match_message_to_state(message).await.unwrap(),
+            State::SendNotSupported
+        ));
+    }
+}
+
+#[tokio::test]
 async fn test_negotiation() {
     let mut policy_engine = Source::new(DummyDriver::new(), DummySourceDevice, false);
 

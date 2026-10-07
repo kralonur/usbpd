@@ -36,14 +36,16 @@ impl From<ExtendedControlMessageType> for u8 {
     }
 }
 
-impl From<u8> for ExtendedControlMessageType {
-    fn from(value: u8) -> Self {
+impl TryFrom<u8> for ExtendedControlMessageType {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            1 => ExtendedControlMessageType::EprGetSourceCap,
-            2 => ExtendedControlMessageType::EprGetSinkCap,
-            3 => ExtendedControlMessageType::EprKeepAlive,
-            4 => ExtendedControlMessageType::EprKeepAliveAck,
-            _ => panic!("Cannot convert {} to ExtendedControlMessageType", value), // Illegal values shall panic.
+            1 => Ok(ExtendedControlMessageType::EprGetSourceCap),
+            2 => Ok(ExtendedControlMessageType::EprGetSinkCap),
+            3 => Ok(ExtendedControlMessageType::EprKeepAlive),
+            4 => Ok(ExtendedControlMessageType::EprKeepAliveAck),
+            _ => Err(()), // Reserved values are unsupported, not a reason to panic.
         }
     }
 }
@@ -58,12 +60,18 @@ bitfield!(
     pub struct ExtendedControl(pub u16): Debug, FromStorage, IntoStorage {
         /// Payload, shall be set to zero when not used.
         pub data: u8 @ 8..=15,
-        /// The extended control message type.
-        pub message_type: u8 [ExtendedControlMessageType] @ 0..=7,
+        /// The extended control message type; reserved values fail to parse.
+        pub try_message_type: u8 [try_get ExtendedControlMessageType] @ 0..=7,
     }
 );
 
 impl ExtendedControl {
+    /// Set the extended control message type from a typed value.
+    pub fn with_message_type(mut self, message_type: ExtendedControlMessageType) -> Self {
+        self.0 = (self.0 & !0xff) | u8::from(message_type) as u16;
+        self
+    }
+
     /// Store the extended control message in a binary buffer, returning the written size in number of bytes.
     pub fn to_bytes(self, buf: &mut [u8]) -> usize {
         LittleEndian::write_u16(buf, self.0);
@@ -80,5 +88,23 @@ impl ExtendedControl {
 impl Default for ExtendedControl {
     fn default() -> Self {
         Self(0).with_data(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reserved_types_are_fallible_and_typed_setter_preserves_data() {
+        for raw in 0..=255 {
+            let control = ExtendedControl(u16::from(raw) | 0xab00);
+            let parsed = control.try_message_type();
+            std::assert_eq!(parsed.is_ok(), (1..=4).contains(&raw));
+            if let Ok(kind) = parsed {
+                std::assert_eq!(u8::from(kind), raw);
+                std::assert_eq!(ExtendedControl(0xabff).with_message_type(kind).0, control.0);
+            }
+        }
     }
 }

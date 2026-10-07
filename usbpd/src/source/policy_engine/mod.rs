@@ -1341,17 +1341,17 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: SourceDpm> Source<DRIVER, TIMER, DPM> {
             MessageType::Control(ControlMessageType::NotSupported) => State::NotSupportedReceived,
 
             MessageType::Extended(ExtendedMessageType::ExtendedControl) => match message.payload {
-                Some(Payload::Extended(Extended::ExtendedControl(ctrl))) => match ctrl.message_type() {
-                    ExtendedControlMessageType::EprGetSourceCap => match self.mode {
+                Some(Payload::Extended(Extended::ExtendedControl(ctrl))) => match ctrl.try_message_type() {
+                    Ok(ExtendedControlMessageType::EprGetSourceCap) => match self.mode {
                         Mode::Spr => State::GiveSourceCap,
                         Mode::Epr => State::SendCapabilities,
                     },
-                    ExtendedControlMessageType::EprGetSinkCap => match self.dual_role {
+                    Ok(ExtendedControlMessageType::EprGetSinkCap) => match self.dual_role {
                         true => State::DrpGiveSinkCap(Mode::Epr),
                         false => State::SendNotSupported,
                     },
-                    ExtendedControlMessageType::EprKeepAlive => State::EprKeepAlive,
-                    ExtendedControlMessageType::EprKeepAliveAck => State::SendNotSupported, // FIXME: Source EPR
+                    Ok(ExtendedControlMessageType::EprKeepAlive) => State::EprKeepAlive,
+                    Ok(ExtendedControlMessageType::EprKeepAliveAck) | Err(()) => State::SendNotSupported,
                 },
                 _ => State::SendNotSupported,
             },

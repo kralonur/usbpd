@@ -625,7 +625,7 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                                 if let Some(Payload::Extended(extended::Extended::ExtendedControl(ctrl))) =
                                     &message.payload
                                 {
-                                    if ctrl.message_type() == ExtendedControlMessageType::EprGetSinkCap {
+                                    if ctrl.try_message_type() == Ok(ExtendedControlMessageType::EprGetSinkCap) {
                                         State::GiveSinkCap(Mode::Epr, *power_source)
                                     } else {
                                         State::SendNotSupported(*power_source)
@@ -1238,8 +1238,8 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                 {
                     Ok(message) => {
                         if let Some(Payload::Extended(extended::Extended::ExtendedControl(control))) = message.payload {
-                            if control.message_type()
-                                == crate::protocol_layer::message::extended::extended_control::ExtendedControlMessageType::EprKeepAliveAck
+                            if control.try_message_type()
+                                == Ok(crate::protocol_layer::message::extended::extended_control::ExtendedControlMessageType::EprKeepAliveAck)
                             {
                                 self.mode = Mode::Epr;
                                 State::Ready(*power_source, false)

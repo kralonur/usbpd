@@ -589,8 +589,8 @@ async fn test_epr_negotiation() {
             &keep_alive.payload
         {
             assert_eq!(
-                ctrl.message_type(),
-                crate::protocol_layer::message::extended::extended_control::ExtendedControlMessageType::EprKeepAlive,
+                ctrl.try_message_type(),
+                Ok(crate::protocol_layer::message::extended::extended_control::ExtendedControlMessageType::EprKeepAlive),
                 "Expected EprKeepAlive message type"
             );
         } else {
@@ -682,6 +682,17 @@ fn transmitted(
     kinds
 }
 const GOOD_CRC: MessageType = MessageType::Control(ControlMessageType::GoodCRC);
+
+#[tokio::test]
+async fn reserved_extended_control_is_unsupported_without_panicking() {
+    for kind in [0, 5, 255] {
+        let mut engine = ready_engine::<true>();
+        inject(&mut engine, source_header(16, 1, 1, true), &[2, 0x80, kind, 0]);
+        engine.run_step().await.unwrap();
+        std::assert!(matches!(engine.state, State::SendNotSupported(_)));
+        std::assert_eq!(transmitted(&mut engine), [GOOD_CRC]);
+    }
+}
 
 #[tokio::test]
 async fn ready_get_revision_returns_the_revision_message() {
