@@ -60,6 +60,15 @@ pub enum Data {
     /// Currently parsed from the wire but not forwarded to user applications.
     /// TODO: Add DevicePolicyManager callback to allow applications to handle vendor-specific messages.
     VendorDefined((vendor_defined::VdmHeader, Vec<u32, 7>)),
+    /// Alert Data Object (ADO), Table 6.25. Additional objects are ignored.
+    Alert(u32),
+    /// Revision Message Data Object (RMDO), Table 6.31.
+    Revision(u32),
+    /// Source_Info: SIDO1 and, from R3.2 V1.2, SIDO2 (Tables 6.29, 6.30).
+    /// Further objects are Ignored.
+    SourceInfo(Vec<u32, 2>),
+    /// BIST Data Object (BDO), Table 6.23. Test data objects are ignored.
+    Bist(u32),
     /// Unknown data type.
     Unknown,
 }
@@ -130,6 +139,16 @@ impl Data {
                     Data::EprMode(epr_mode::EprModeDataObject(LittleEndian::read_u32(payload)))
                 }
             }
+            DataMessageType::Alert if len >= PDO_SIZE => Data::Alert(LittleEndian::read_u32(payload)),
+            DataMessageType::Revision if len >= PDO_SIZE => Data::Revision(LittleEndian::read_u32(payload)),
+            DataMessageType::SourceInfo if len >= PDO_SIZE => Data::SourceInfo(
+                payload
+                    .chunks_exact(PDO_SIZE)
+                    .take(message.header.num_objects().min(2))
+                    .map(LittleEndian::read_u32)
+                    .collect(),
+            ),
+            DataMessageType::Bist if len >= PDO_SIZE => Data::Bist(LittleEndian::read_u32(payload)),
             DataMessageType::VendorDefined => {
                 // Keep for now...
                 if len < PDO_SIZE {
@@ -211,6 +230,16 @@ impl Data {
             Self::EprMode(epr_mode::EprModeDataObject(data_object)) => {
                 LittleEndian::write_u32(payload, *data_object);
                 PDO_SIZE
+            }
+            Self::Alert(data_object) | Self::Revision(data_object) | Self::Bist(data_object) => {
+                LittleEndian::write_u32(payload, *data_object);
+                PDO_SIZE
+            }
+            Self::SourceInfo(objects) => {
+                for (chunk, object) in payload.chunks_exact_mut(PDO_SIZE).zip(objects) {
+                    LittleEndian::write_u32(chunk, *object);
+                }
+                objects.len() * PDO_SIZE
             }
             Self::VendorDefined(_) => unimplemented!(),
         }

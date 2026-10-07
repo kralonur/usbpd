@@ -112,7 +112,12 @@ impl Message {
                     .with_chunked(true)
                     .with_chunk_number(0);
                 let ext_header_len = extended_header.to_bytes(&mut buffer[header_len..]);
-                header_len + ext_header_len + extended.to_bytes(&mut buffer[header_len + ext_header_len..])
+                let written = ext_header_len + extended.to_bytes(&mut buffer[header_len + ext_header_len..]);
+                // Section 6.5.1.1 / Table 6.48: a Chunk is padded with 00h to the
+                // Data Objects the header counts. A zero object count is unchanged.
+                let padded = written.max(self.header.num_objects() * 4);
+                buffer[header_len + written..header_len + padded].fill(0);
+                header_len + padded
             }
             None => header_len,
         }
@@ -146,7 +151,12 @@ impl Message {
                     })
                     .collect(),
             ),
-            _ => extended::Extended::Unknown,
+            // Table 6.58: the PPSSDB is exactly 4 bytes.
+            header::ExtendedMessageType::PpsStatus => match <[u8; 4]>::try_from(payload) {
+                Ok(block) => extended::Extended::PpsStatus(block),
+                Err(_) => extended::Extended::Unknown,
+            },
+            _ => extended::Extended::information(message_type, payload).unwrap_or(extended::Extended::Unknown),
         }
     }
 
@@ -218,9 +228,12 @@ impl Message {
                 let payload_bytes = &payload[2..2 + data_size];
                 Ok(Self {
                     payload: Some(Payload::Extended(match message_type {
-                        header::ExtendedMessageType::ExtendedControl => extended::Extended::ExtendedControl(
-                            extended::extended_control::ExtendedControl(LittleEndian::read_u16(payload_bytes)),
-                        ),
+                        // A truncated ECDB is unsupported, never a parser panic.
+                        header::ExtendedMessageType::ExtendedControl if payload_bytes.len() >= 2 => {
+                            extended::Extended::ExtendedControl(extended::extended_control::ExtendedControl(
+                                LittleEndian::read_u16(payload_bytes),
+                            ))
+                        }
                         header::ExtendedMessageType::EprSourceCapabilities => {
                             extended::Extended::EprSourceCapabilities(
                                 payload_bytes
@@ -233,7 +246,15 @@ impl Message {
                                     .collect(),
                             )
                         }
-                        _ => extended::Extended::Unknown,
+                        // Table 6.58: the PPSSDB is exactly 4 bytes.
+                        header::ExtendedMessageType::PpsStatus if data_size == 4 => extended::Extended::PpsStatus([
+                            payload_bytes[0],
+                            payload_bytes[1],
+                            payload_bytes[2],
+                            payload_bytes[3],
+                        ]),
+                        _ => extended::Extended::information(message_type, payload_bytes)
+                            .unwrap_or(extended::Extended::Unknown),
                     })),
                     ..message
                 })
