@@ -684,6 +684,27 @@ fn transmitted(
 const GOOD_CRC: MessageType = MessageType::Control(ControlMessageType::GoodCRC);
 
 #[tokio::test]
+async fn malformed_epr_mode_responses_soft_reset_without_panicking() {
+    use uom::si::power::watt;
+    for waiting in [false, true] {
+        let mut engine = ready_engine::<true>();
+        let established = engine.established_request.unwrap();
+        engine.state = if waiting {
+            State::EprEntryWaitForResponse(established)
+        } else {
+            State::EprModeEntry(established, crate::units::Power::new::<watt>(140))
+        };
+        if !waiting {
+            simulate_source_control_message(&mut engine, ControlMessageType::GoodCRC, 0);
+        }
+        // An EPR_Mode header with no data object parses as Data::Unknown.
+        inject(&mut engine, source_header(10, 1, 1, false), &[]);
+        engine.run_step().await.unwrap();
+        std::assert!(matches!(engine.state, State::SendSoftReset));
+    }
+}
+
+#[tokio::test]
 async fn reserved_extended_control_is_unsupported_without_panicking() {
     for kind in [0, 5, 255] {
         let mut engine = ready_engine::<true>();

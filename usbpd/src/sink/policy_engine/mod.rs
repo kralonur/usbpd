@@ -350,7 +350,7 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
         let capabilities = match message.payload {
             Some(Payload::Data(Data::SourceCapabilities(caps))) => caps,
             Some(Payload::Extended(extended::Extended::EprSourceCapabilities(pdos))) => SourceCapabilities(pdos),
-            _ => unreachable!(),
+            _ => return Err(Error::Protocol(ProtocolError::UnexpectedMessage)),
         };
 
         Ok(capabilities)
@@ -512,12 +512,13 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                                 if self.mode == Mode::Epr && !self.get_source_cap_pending {
                                     State::HardReset
                                 } else {
-                                    let Some(Payload::Data(Data::SourceCapabilities(capabilities))) = message.payload
-                                    else {
-                                        unreachable!()
-                                    };
                                     self.get_source_cap_pending = false;
-                                    State::EvaluateCapabilities(capabilities)
+                                    match message.payload {
+                                        Some(Payload::Data(Data::SourceCapabilities(capabilities))) => {
+                                            State::EvaluateCapabilities(capabilities)
+                                        }
+                                        _ => State::SendNotSupported(*power_source),
+                                    }
                                 }
                             }
                             MessageType::Extended(ExtendedMessageType::EprSourceCapabilities) if DPM::EPR => {
@@ -535,7 +536,7 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                                         State::EvaluateCapabilities(caps)
                                     }
                                 } else {
-                                    unreachable!()
+                                    State::HardReset
                                 }
                             }
                             // An SPR-only contract has no EPR Mode to exit; unsupported below.
@@ -1075,7 +1076,10 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                     Some(Payload::Extended(extended::Extended::EprSourceCapabilities(pdos))) => {
                         SourceCapabilities(pdos)
                     }
-                    _ => unreachable!(),
+                    _ => {
+                        self.state = State::SendNotSupported(*power_source);
+                        return Ok(());
+                    }
                 };
 
                 self.device_policy_manager.inform(&capabilities).await;
@@ -1112,7 +1116,8 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                     .await?;
 
                 let Some(Payload::Data(Data::EprMode(epr_mode))) = message.payload else {
-                    unreachable!()
+                    self.state = State::SendSoftReset;
+                    return Ok(());
                 };
 
                 match epr_mode.action() {
@@ -1147,7 +1152,8 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                     .await?;
 
                 let Some(Payload::Data(Data::EprMode(epr_mode))) = message.payload else {
-                    unreachable!()
+                    self.state = State::SendSoftReset;
+                    return Ok(());
                 };
 
                 match epr_mode.action() {

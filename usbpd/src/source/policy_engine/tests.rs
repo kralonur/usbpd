@@ -90,6 +90,38 @@ async fn run_test_step<DPM: SourceDpm>(
 }
 
 #[tokio::test]
+async fn malformed_requests_are_unsupported_without_panicking() {
+    for (mode, kind) in [
+        (super::Mode::Spr, DataMessageType::Request),
+        (super::Mode::Epr, DataMessageType::EprRequest),
+    ] {
+        let mut engine =
+            Source::<_, DummyTimer, _>::new(DummyDriver::<MAX_DATA_MESSAGE_SIZE>::new(), DummySourceDevice, false);
+        engine.mode = mode;
+        let header = Header::new_data(
+            get_sink_header_template(),
+            Counter::new(CounterType::MessageId),
+            kind,
+            1,
+        );
+        let mut bytes = [0; MAX_DATA_MESSAGE_SIZE];
+        let length = Message::new(header).to_bytes(&mut bytes);
+        let message = Message::from_bytes(&bytes[..length]).unwrap();
+        std::assert!(matches!(
+            engine.match_message_to_state(message).await.unwrap(),
+            State::SendNotSupported
+        ));
+        engine.protocol_layer.driver().inject_received_data(&bytes[..length]);
+        std::assert!(matches!(
+            engine.wait_for_sink_request().await,
+            Err(super::Error::Protocol(
+                crate::protocol_layer::ProtocolError::UnexpectedMessage
+            ))
+        ));
+    }
+}
+
+#[tokio::test]
 async fn reserved_extended_control_is_unsupported_without_panicking() {
     use crate::protocol_layer::message::Payload;
     use crate::protocol_layer::message::extended::Extended;
