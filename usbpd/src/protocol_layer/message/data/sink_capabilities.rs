@@ -217,6 +217,39 @@ impl Default for VariableSupply {
     }
 }
 
+bitfield! {
+    /// A Sink SPR Programmable Power Supply APDO.
+    ///
+    /// Per USB PD Spec R3.2 V1.2 Table 6.14.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+    pub struct SprPps(pub u32): Debug, FromStorage, IntoStorage {
+        /// Augmented Power Data Object (11b)
+        pub kind: u8 @ 30..=31,
+        /// APDO type: PPS (00b)
+        pub apdo_kind: u8 @ 28..=29,
+        /// Maximum Voltage in 100 mV units (50..=210)
+        pub raw_max_voltage: u8 @ 17..=24,
+        /// Minimum Voltage in 100 mV units (50; 33 is deprecated)
+        pub raw_min_voltage: u8 @ 8..=15,
+        /// Maximum Current in 50 mA units (0..=100)
+        pub raw_max_current: u8 @ 0..=6,
+    }
+}
+
+impl SprPps {
+    /// Create a new Sink PPS APDO; reserved bits are zero.
+    pub fn new(min_voltage_100mv: u8, max_voltage_100mv: u8, max_current_50ma: u8) -> Self {
+        Self(0)
+            .with_kind(0b11)
+            .with_apdo_kind(0b00)
+            .with_raw_min_voltage(min_voltage_100mv)
+            .with_raw_max_voltage(max_voltage_100mv)
+            .with_raw_max_current(max_current_50ma)
+    }
+}
+
 /// A Sink Power Data Object.
 ///
 /// Per USB PD Spec R3.2 Section 6.4.1.6, sinks report power levels they can
@@ -231,6 +264,8 @@ pub enum SinkPowerDataObject {
     Battery(Battery),
     /// Variable voltage supply requirement.
     VariableSupply(VariableSupply),
+    /// SPR PPS requirement (Table 6.14).
+    Pps(SprPps),
 }
 
 impl SinkPowerDataObject {
@@ -240,6 +275,7 @@ impl SinkPowerDataObject {
             SinkPowerDataObject::FixedSupply(f) => f.0,
             SinkPowerDataObject::Battery(b) => b.0,
             SinkPowerDataObject::VariableSupply(v) => v.0,
+            SinkPowerDataObject::Pps(p) => p.0,
         }
     }
 }
@@ -297,5 +333,24 @@ impl SinkCapabilities {
             offset += 4;
         }
         offset
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spr_pps_sink_apdo_matches_table_6_14() {
+        // 5.0-21.0 V, 4.75 A: type 11b, APDO 00b, reserved bits zero.
+        let apdo = SprPps::new(50, 210, 95);
+        assert_eq!(apdo.0, 0xc1a4_325f);
+        let mut caps = Vec::new();
+        caps.push(SinkPowerDataObject::FixedSupply(FixedSupply::new_vsafe5v(10)))
+            .unwrap();
+        caps.push(SinkPowerDataObject::Pps(apdo)).unwrap();
+        let mut bytes = [0; 8];
+        assert_eq!(SinkCapabilities::new(caps).to_bytes(&mut bytes), 8);
+        assert_eq!(bytes, [0x0a, 0x90, 0x01, 0x00, 0x5f, 0x32, 0xa4, 0xc1]);
     }
 }
