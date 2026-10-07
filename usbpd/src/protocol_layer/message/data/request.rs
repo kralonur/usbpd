@@ -452,9 +452,10 @@ impl PowerSource {
 
         let mut raw_current = current.get::<_50milliamperes>() as u16;
 
-        if raw_current > 0x3ff {
-            error!("Clamping invalid current: {} mA", 10 * raw_current);
-            raw_current = 0x3ff;
+        // PPS operating current is a 7-bit field in 50 mA units.
+        if raw_current > 0x7f {
+            error!("Clamping invalid PPS operating current: {} mA", 50 * raw_current);
+            raw_current = 0x7f;
         }
 
         let raw_voltage = voltage.get::<_20millivolts>() as u16;
@@ -529,5 +530,45 @@ impl PowerSource {
         let pdo_copy = source_capabilities::PowerDataObject::Augmented(*pdo);
 
         Ok(Self::EprRequest(EprRequestDataObject { rdo, pdo: pdo_copy }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use heapless::Vec;
+    use uom::si::electric_current::milliampere;
+    use uom::si::electric_potential::volt;
+
+    use super::source_capabilities::{Augmented, PowerDataObject, SourceCapabilities, SprProgrammablePowerSupply};
+    use super::*;
+
+    #[test]
+    fn pps_current_is_clamped_to_its_seven_bit_field() {
+        let pdo = SprProgrammablePowerSupply::default()
+            .with_raw_min_voltage(50)
+            .with_raw_max_voltage(210)
+            .with_raw_max_current(100);
+        let mut pdos = Vec::new();
+        pdos.push(PowerDataObject::Augmented(Augmented::Spr(pdo))).unwrap();
+        let capabilities = SourceCapabilities(pdos);
+        for (milliamps, expected, mismatch) in [
+            (4750, 95, false),
+            (6350, 127, true),
+            (6400, 127, true),
+            (10000, 127, true),
+        ] {
+            let PowerSource::Pps(rdo) = PowerSource::new_pps(
+                CurrentRequest::Specific(ElectricCurrent::new::<milliampere>(milliamps)),
+                ElectricPotential::new::<volt>(9),
+                &capabilities,
+            )
+            .unwrap() else {
+                std::panic!("PPS request");
+            };
+            std::assert_eq!(rdo.raw_operating_current(), expected);
+            std::assert_eq!(rdo.capability_mismatch(), mismatch);
+            std::assert_eq!(rdo.object_position(), 1);
+            std::assert_eq!(rdo.raw_output_voltage(), 450);
+        }
     }
 }
