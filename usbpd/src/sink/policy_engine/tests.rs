@@ -974,6 +974,26 @@ async fn deferred_sink_initiated_request_returns_to_ready_without_using_a_messag
 }
 
 #[tokio::test]
+async fn deferred_get_source_cap_returns_to_ready_instead_of_sending_again() {
+    use crate::protocol_layer::message::data::request::FixedVariableSupply;
+    let mut engine: Sink<DeferringDriver, DummyTimer, DeferredRecorder> = Sink::new(
+        DeferringDriver {
+            defer: 1,
+            tx: std::vec::Vec::new(),
+        },
+        DeferredRecorder::default(),
+    );
+    let established = PowerSource::FixedVariableSupply(FixedVariableSupply(0x1000_280a));
+    engine.contract = super::Contract::Explicit;
+    engine.established_request = Some(established);
+    engine.state = State::GetSourceCap(super::Mode::Epr, established);
+    engine.run_step().await.unwrap();
+    std::assert!(matches!(engine.state, State::Ready(_, false)));
+    std::assert!(!engine.get_source_cap_pending);
+    std::assert!(engine.protocol_layer.driver().tx.is_empty());
+}
+
+#[tokio::test]
 async fn deferred_request_without_explicit_contract_is_not_turned_into_ready() {
     use crate::protocol_layer::message::data::request::FixedVariableSupply;
     let mut engine: Sink<DeferringDriver, DummyTimer, DeferredRecorder> = Sink::new(

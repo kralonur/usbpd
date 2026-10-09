@@ -216,6 +216,16 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                 self.state = State::Ready(power_source, false);
                 return Ok(());
             }
+            // The same for an unsent Get_Source_Cap or EPR_Get_Source_Cap
+            // (PE_SNK_Get_Source_Cap): no AMS started, so nothing is awaited.
+            if let (State::GetSourceCap(_, power_source), ProtocolError::TransmitDeferred) =
+                (&self.state, &protocol_error)
+            {
+                let power_source = *power_source;
+                self.get_source_cap_pending = false;
+                self.state = State::Ready(power_source, false);
+                return Ok(());
+            }
             let new_state = match (&self.mode, &self.state, protocol_error) {
                 // Handle when hard reset is signaled by the driver itself.
                 (_, _, ProtocolError::RxError(RxError::HardReset) | ProtocolError::TxError(TxError::HardReset)) => {
