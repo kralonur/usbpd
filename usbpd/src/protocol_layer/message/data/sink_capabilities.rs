@@ -250,6 +250,36 @@ impl SprPps {
     }
 }
 
+bitfield! {
+    /// A Sink SPR Adjustable Voltage Supply APDO.
+    ///
+    /// Per USB PD Spec R3.2 V1.2 Table 6.15; Peak Current is reserved for a Sink.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+    pub struct SprAvs(pub u32): Debug, FromStorage, IntoStorage {
+        /// Augmented Power Data Object (11b)
+        pub kind: u8 @ 30..=31,
+        /// APDO type: SPR AVS (10b)
+        pub apdo_kind: u8 @ 28..=29,
+        /// Maximum current from 9 V to 15 V in 10 mA units (0..=500)
+        pub raw_max_current_15v: u16 @ 10..=19,
+        /// Maximum current from 15 V to 20 V in 10 mA units (0..=500), 0 when the range ends at 15 V
+        pub raw_max_current_20v: u16 @ 0..=9,
+    }
+}
+
+impl SprAvs {
+    /// Create a new Sink SPR AVS APDO; reserved bits are zero.
+    pub fn new(max_current_15v_10ma: u16, max_current_20v_10ma: u16) -> Self {
+        Self(0)
+            .with_kind(0b11)
+            .with_apdo_kind(0b10)
+            .with_raw_max_current_15v(max_current_15v_10ma)
+            .with_raw_max_current_20v(max_current_20v_10ma)
+    }
+}
+
 /// A Sink Power Data Object.
 ///
 /// Per USB PD Spec R3.2 Section 6.4.1.6, sinks report power levels they can
@@ -266,6 +296,8 @@ pub enum SinkPowerDataObject {
     VariableSupply(VariableSupply),
     /// SPR PPS requirement (Table 6.14).
     Pps(SprPps),
+    /// SPR AVS requirement (Table 6.15).
+    SprAvs(SprAvs),
 }
 
 impl SinkPowerDataObject {
@@ -276,6 +308,7 @@ impl SinkPowerDataObject {
             SinkPowerDataObject::Battery(b) => b.0,
             SinkPowerDataObject::VariableSupply(v) => v.0,
             SinkPowerDataObject::Pps(p) => p.0,
+            SinkPowerDataObject::SprAvs(a) => a.0,
         }
     }
 }
