@@ -333,7 +333,7 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
     ///
     /// This catches common mistakes when constructing messages:
     /// - unchunked_extended_messages_supported should always be false
-    /// - AVS voltage LSB 2 bits should be zero (per USB PD 3.2 Table 6.26)
+    /// - AVS voltage LSB 2 bits should be zero (per USB PD 3.2 Table 6.22)
     ///
     /// Only validates outgoing messages - never called when parsing received data.
     /// Returns an error if validation fails, allowing the caller to handle it appropriately.
@@ -349,6 +349,14 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
                 PowerSource::Pps(rdo) => {
                     if rdo.unchunked_extended_messages_supported() {
                         return Err(TxError::UnchunkedExtendedMessagesNotSupported);
+                    }
+                }
+                PowerSource::Avs(rdo) => {
+                    if rdo.unchunked_extended_messages_supported() {
+                        return Err(TxError::UnchunkedExtendedMessagesNotSupported);
+                    }
+                    if rdo.raw_output_voltage() & 0x3 != 0 {
+                        return Err(TxError::AvsVoltageAlignmentInvalid);
                     }
                 }
                 PowerSource::EprRequest(epr) => {
