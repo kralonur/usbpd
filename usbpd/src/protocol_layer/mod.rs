@@ -1003,6 +1003,34 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
         self.transmit(message).await
     }
 
+    /// Transmit Get_Battery_Cap (section 6.5.4) for Battery `reference`
+    /// (Table 6.53): Chunked Chunk 0 of 1 byte in one Data Object (Table 6.48).
+    pub async fn transmit_get_battery_cap(&mut self, reference: u8) -> Result<(), ProtocolError> {
+        let header = Header::new_extended(
+            self.default_header,
+            self.counters.tx_message,
+            ExtendedMessageType::GetBatteryCap,
+            1,
+        );
+        let mut message = Message::new(header);
+        message.payload = Some(Payload::Extended(Extended::GetBatteryCap([reference])));
+        self.transmit(message).await
+    }
+
+    /// Transmit Get_Battery_Status (section 6.5.5) for Battery `reference`
+    /// (Table 6.54): Chunked Chunk 0 of 1 byte in one Data Object (Table 6.48).
+    pub async fn transmit_get_battery_status(&mut self, reference: u8) -> Result<(), ProtocolError> {
+        let header = Header::new_extended(
+            self.default_header,
+            self.counters.tx_message,
+            ExtendedMessageType::GetBatteryStatus,
+            1,
+        );
+        let mut message = Message::new(header);
+        message.payload = Some(Payload::Extended(Extended::GetBatteryStatus([reference])));
+        self.transmit(message).await
+    }
+
     /// Transmit sink capabilities in response to Get_Sink_Cap.
     ///
     /// Per USB PD Spec R3.2 Section 6.4.1.6, sinks respond to Get_Sink_Cap messages

@@ -69,6 +69,8 @@ pub enum Data {
     SourceInfo(Vec<u32, 2>),
     /// BIST Data Object (BDO), Table 6.23. Test data objects are ignored.
     Bist(u32),
+    /// Battery Status Data Object (BSDO), Table 6.24.
+    BatteryStatus(u32),
     /// Unknown data type.
     Unknown,
 }
@@ -142,6 +144,7 @@ impl Data {
                 }
             }
             DataMessageType::Alert if len >= PDO_SIZE => Data::Alert(LittleEndian::read_u32(payload)),
+            DataMessageType::BatteryStatus if len >= PDO_SIZE => Data::BatteryStatus(LittleEndian::read_u32(payload)),
             DataMessageType::Revision if len >= PDO_SIZE => Data::Revision(LittleEndian::read_u32(payload)),
             DataMessageType::SourceInfo if len >= PDO_SIZE => Data::SourceInfo(
                 payload
@@ -227,7 +230,10 @@ impl Data {
                 LittleEndian::write_u32(payload, *data_object);
                 PDO_SIZE
             }
-            Self::Alert(data_object) | Self::Revision(data_object) | Self::Bist(data_object) => {
+            Self::Alert(data_object)
+            | Self::Revision(data_object)
+            | Self::Bist(data_object)
+            | Self::BatteryStatus(data_object) => {
                 LittleEndian::write_u32(payload, *data_object);
                 PDO_SIZE
             }

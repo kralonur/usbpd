@@ -824,6 +824,14 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                             .await?;
                         MessageType::Extended(ExtendedMessageType::Status)
                     }
+                    PartnerQuery::BatteryCapabilities(reference) => {
+                        self.protocol_layer.transmit_get_battery_cap(*reference).await?;
+                        MessageType::Extended(ExtendedMessageType::BatteryCapabilities)
+                    }
+                    PartnerQuery::BatteryStatus(reference) => {
+                        self.protocol_layer.transmit_get_battery_status(*reference).await?;
+                        MessageType::Data(DataMessageType::BatteryStatus)
+                    }
                 };
                 let result = self
                     .protocol_layer
@@ -846,6 +854,12 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                         }
                         Some(Payload::Extended(extended::Extended::Status(block))) => {
                             QueryOutcome::Answer(heapless::Vec::from_slice(&block).expect("7 <= 26"))
+                        }
+                        Some(Payload::Extended(extended::Extended::BatteryCapabilities(block))) => {
+                            QueryOutcome::Answer(heapless::Vec::from_slice(&block).expect("9 <= 26"))
+                        }
+                        Some(Payload::Data(Data::BatteryStatus(bsdo))) => {
+                            QueryOutcome::Answer(heapless::Vec::from_slice(&bsdo.to_le_bytes()).expect("4 <= 26"))
                         }
                         Some(Payload::Data(Data::SourceInfo(objects))) => {
                             let mut block = heapless::Vec::new();

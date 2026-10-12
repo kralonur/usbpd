@@ -70,15 +70,21 @@ pub enum PartnerQuery {
     SourceInfo,
     /// Get_Status -> Status (PE_Get_Status, section 9.2.11.1.1).
     Status,
+    /// Get_Battery_Cap for Battery `reference` (Table 6.53) ->
+    /// Battery_Capabilities (PE_Get_Battery_Cap, section 9.2.12.1.1).
+    BatteryCapabilities(u8),
+    /// Get_Battery_Status for Battery `reference` (Table 6.54) ->
+    /// Battery_Status (PE_Get_Battery_Status, section 9.2.13.1.1).
+    BatteryStatus(u8),
 }
 
 /// Outcome of a [`PartnerQuery`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryOutcome {
     /// The answer's Data Block as received: the SCEDB (Table 6.50), the
-    /// Manufacturer_Info block (Table 6.57), the SDB (Table 6.51), or the
-    /// RMDO (Table 6.31) / SIDO1 and SIDO2 (Tables 6.29, 6.30) in
-    /// little-endian byte order.
+    /// Manufacturer_Info block (Table 6.57), the SDB (Table 6.51), the BCDB
+    /// (Table 6.55), or the RMDO (Table 6.31) / SIDO1 and SIDO2 (Tables 6.29,
+    /// 6.30) / BSDO (Table 6.24) in little-endian byte order.
     Answer(heapless::Vec<u8, 26>),
     /// The Source answered Not_Supported.
     NotSupported,

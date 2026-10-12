@@ -12,6 +12,9 @@ use crate::protocol_layer::message::data::sink_capabilities::SinkPowerDataObject
 use crate::protocol_layer::message::data::source_capabilities::PowerDataObject;
 use crate::protocol_layer::message::header::ExtendedMessageType;
 
+/// Battery Capability Data Block length in bytes (Table 6.55).
+pub const BATTERY_CAPABILITIES_LEN: usize = 9;
+
 /// Types of extended messages.
 ///
 /// TODO: Add missing types as per [6.5] and [Table 6.53].
@@ -29,6 +32,12 @@ pub enum Extended {
     /// Manufacturer_Info Data Block (Table 6.57) as received: VID, PID and a
     /// string of up to 22 bytes (4..26 bytes).
     ManufacturerInfo(Vec<u8, 26>),
+    /// Get Battery Cap Data Block (GBCDB, Table 6.53): Battery Cap Ref.
+    GetBatteryCap([u8; 1]),
+    /// Get Battery Status Data Block (GBSDB, Table 6.54): Battery Status Ref.
+    GetBatteryStatus([u8; 1]),
+    /// Battery Capability Data Block (BCDB, Table 6.55), raw bytes.
+    BatteryCapabilities([u8; BATTERY_CAPABILITIES_LEN]),
     /// SOP Status Data Block (SDB, Table 6.51) as received: 7 bytes, or 5..6
     /// from a Source of an earlier revision.
     Status(Vec<u8, 7>),
@@ -54,6 +63,8 @@ impl Extended {
             Self::GetManufacturerInfo(block) => block.len() as u16,
             Self::ManufacturerInfo(block) => block.len() as u16,
             Self::Status(block) => block.len() as u16,
+            Self::GetBatteryCap(block) | Self::GetBatteryStatus(block) => block.len() as u16,
+            Self::BatteryCapabilities(block) => block.len() as u16,
             Self::ExtendedControl(_payload) => 2,
             Self::EprSourceCapabilities(pdos) => (pdos.len() * core::mem::size_of::<u32>()) as u16,
             Self::EprSinkCapabilities(pdos) => (pdos.len() * core::mem::size_of::<u32>()) as u16,
@@ -80,6 +91,14 @@ impl Extended {
                 block.len()
             }
             Self::Status(block) => {
+                payload[..block.len()].copy_from_slice(block);
+                block.len()
+            }
+            Self::GetBatteryCap(block) | Self::GetBatteryStatus(block) => {
+                payload[..block.len()].copy_from_slice(block);
+                block.len()
+            }
+            Self::BatteryCapabilities(block) => {
                 payload[..block.len()].copy_from_slice(block);
                 block.len()
             }
@@ -129,6 +148,9 @@ impl Extended {
             ExtendedMessageType::Status if payload.len() >= 5 => {
                 Some(Self::Status(Vec::from_slice(&payload[..payload.len().min(7)]).ok()?))
             }
+            ExtendedMessageType::BatteryCapabilities => Some(Self::BatteryCapabilities(
+                payload.get(..BATTERY_CAPABILITIES_LEN)?.try_into().ok()?,
+            )),
             _ => None,
         }
     }
@@ -216,6 +238,17 @@ mod tests {
                 }
             }
         }
+    }
+
+    // A short BCDB must not become a Battery_Capabilities answer: its
+    // capacities would be read from padding.
+    #[test]
+    fn battery_capabilities_need_the_whole_block() {
+        let block: [u8; BATTERY_CAPABILITIES_LEN] = core::array::from_fn(|i| i as u8 + 1);
+        let full = Extended::information(ExtendedMessageType::BatteryCapabilities, &block);
+        std::assert!(matches!(full, Some(Extended::BatteryCapabilities(got)) if got == block));
+        let short = Extended::information(ExtendedMessageType::BatteryCapabilities, &block[..8]);
+        std::assert!(short.is_none());
     }
 
     #[test]
