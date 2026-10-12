@@ -1,7 +1,7 @@
 //! Policy engine for the implementation of a sink.
 use core::marker::PhantomData;
 
-use embassy_futures::select::{Either3, select3};
+use embassy_futures::select::{Either, Either3, select, select3};
 use uom::si::power::watt;
 use usbpd_traits::Driver;
 
@@ -86,7 +86,6 @@ enum State {
 
     // EPR states
     EprModeEntry(request::PowerSource, units::Power),
-    EprEntryWaitForResponse(request::PowerSource),
     EprWaitForCapabilities(request::PowerSource),
     EprSendExit,
     EprExitReceived(request::PowerSource),
@@ -226,6 +225,14 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                 self.state = State::Ready(power_source, false);
                 return Ok(());
             }
+            if let (State::EprModeEntry(power_source, _), ProtocolError::TransmitDeferred) =
+                (&self.state, &protocol_error)
+            {
+                let power_source = *power_source;
+                self.device_policy_manager.epr_mode_entry_aborted(true).await;
+                self.state = State::Ready(power_source, false);
+                return Ok(());
+            }
             let new_state = match (&self.mode, &self.state, protocol_error) {
                 // Handle when hard reset is signaled by the driver itself.
                 (_, _, ProtocolError::RxError(RxError::HardReset) | ProtocolError::TxError(TxError::HardReset)) => {
@@ -257,6 +264,14 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                 (_, State::WaitForCapabilities | State::SelectCapability(_), ref error)
                     if self.recovering && !matches!(error, ProtocolError::RxError(RxError::ReceiveTimeout)) =>
                 {
+                    Some(State::HardReset)
+                }
+
+                (_, State::GiveSinkCap(Mode::Epr, _), ProtocolError::RxError(RxError::ReceiveTimeout)) => {
+                    Some(State::SendSoftReset)
+                }
+                (_, State::EprWaitForCapabilities(_), _) => Some(State::HardReset),
+                (_, State::EprKeepAlive(_) | State::EprSendExit, ProtocolError::TransmitDeferred) => {
                     Some(State::HardReset)
                 }
 
@@ -400,6 +415,10 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                 State::SelectCapability(request)
             }
             State::SelectCapability(power_source) => {
+                // Section 6.4.10.2: even SPR PDOs require EPR_Request in EPR mode.
+                if (self.mode == Mode::Epr) != matches!(power_source, PowerSource::EprRequest(_)) {
+                    return Err(ProtocolError::UnexpectedMessage.into());
+                }
                 self.protocol_layer.request_power(*power_source).await?;
 
                 let message_type = self
@@ -551,8 +570,13 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                             }
                             // An SPR-only contract has no EPR Mode to exit; unsupported below.
                             MessageType::Data(DataMessageType::EprMode) if self.mode == Mode::Epr => {
-                                // Handle source exit notification.
-                                State::EprExitReceived(*power_source)
+                                if matches!(message.payload, Some(Payload::Data(Data::EprMode(mode)))
+                                    if mode.action() == Action::Exit)
+                                {
+                                    State::EprExitReceived(*power_source)
+                                } else {
+                                    State::SendSoftReset
+                                }
                             }
                             // PE_SNK_Source_Alert_Received: inform the DPM, no response.
                             MessageType::Data(DataMessageType::Alert) if pd3 => {
@@ -652,8 +676,13 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                     Either3::Second(event) => match event {
                         Event::RequestSprSourceCapabilities => State::GetSourceCap(Mode::Spr, *power_source),
                         Event::RequestEprSourceCapabilities => State::GetSourceCap(Mode::Epr, *power_source),
-                        Event::EnterEprMode(pdp) => State::EprModeEntry(*power_source, pdp),
-                        Event::ExitEprMode => State::EprSendExit,
+                        Event::EnterEprMode(pdp) if DPM::EPR && self.mode == Mode::Spr => {
+                            State::EprModeEntry(*power_source, pdp)
+                        }
+                        Event::ExitEprMode if self.mode == Mode::Epr && power_source.object_position() <= 7 => {
+                            State::EprSendExit
+                        }
+                        Event::EnterEprMode(_) | Event::ExitEprMode => State::Ready(*power_source, false),
                         Event::RequestPower(power_source) => State::SelectCapability(power_source),
                         Event::DiscoverCable => State::DiscoverCable(*power_source),
                         // Get_PPS_Status exists only in PD3 and only for a PPS contract.
@@ -1019,7 +1048,9 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                         self.protocol_layer.transmit_sink_capabilities(sink_caps).await?;
                     }
                     Mode::Epr => {
-                        self.protocol_layer.transmit_epr_sink_capabilities(sink_caps).await?;
+                        self.protocol_layer
+                            .transmit_epr_sink_capabilities(self.device_policy_manager.epr_sink_capabilities())
+                            .await?;
                     }
                 }
 
@@ -1121,96 +1152,84 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                 //
                 // Per spec 6.4.10, the Data field shall be set to the EPR Sink Operational PDP.
                 //
-                // Note: The spec says SinkEPREnterTimer (500ms) should run continuously across
-                // both EprModeEntry and EprEntryWaitForResponse states until stopped or timeout.
-                // Our implementation uses SenderResponseTimer (30ms) here and a fresh
-                // SinkEPREnterTimer (500ms) in EprEntryWaitForResponse. This means the total
-                // timeout could be ~530ms instead of 500ms in edge cases. However, this is
-                // within the spec's allowed range (tEnterEPR max = 550ms per Table 6.71).
                 let pdp_watts: u8 = operational_pdp.get::<watt>() as u8;
                 self.protocol_layer.transmit_epr_mode(Action::Enter, pdp_watts).await?;
 
-                // Wait for EnterAcknowledged with SenderResponseTimer (spec step 9-14)
-                let message = self
-                    .protocol_layer
-                    .receive_message_type(
-                        &[MessageType::Data(DataMessageType::EprMode)],
-                        TimerType::SenderResponse,
-                    )
-                    .await?;
-
-                let Some(Payload::Data(Data::EprMode(epr_mode))) = message.payload else {
-                    self.state = State::SendSoftReset;
-                    return Ok(());
-                };
-
-                match epr_mode.action() {
-                    Action::EnterAcknowledged => {
-                        // Source acknowledged, now wait for EnterSucceeded
-                        State::EprEntryWaitForResponse(*power_source)
+                // Section 6.6.21.1: one continuous timer, anchored at Enter's
+                // GoodCRC, spans both Ack and Succeeded.
+                let exchange = async {
+                    let ack = self
+                        .protocol_layer
+                        .receive_message_type(
+                            &[MessageType::Data(DataMessageType::EprMode)],
+                            TimerType::SenderResponse,
+                        )
+                        .await?;
+                    let Some(Payload::Data(Data::EprMode(ack))) = ack.payload else {
+                        return Err(ProtocolError::UnexpectedMessage);
+                    };
+                    if ack.action() != Action::EnterAcknowledged {
+                        return if ack.action() == Action::EnterFailed {
+                            Ok(ack)
+                        } else {
+                            Err(ProtocolError::UnexpectedMessage)
+                        };
                     }
-                    Action::EnterSucceeded => {
-                        // Source skipped EnterAcknowledged and went directly to EnterSucceeded
+                    let succeeded = self
+                        .protocol_layer
+                        .receive_message_type(&[MessageType::Data(DataMessageType::EprMode)], TimerType::SinkEPREnter)
+                        .await?;
+                    match succeeded.payload {
+                        Some(Payload::Data(Data::EprMode(mode))) => Ok(mode),
+                        _ => Err(ProtocolError::UnexpectedMessage),
+                    }
+                };
+                match select(TimerType::get_timer::<TIMER>(TimerType::SinkEPREnter), exchange).await {
+                    Either::Second(Ok(mode)) if mode.action() == Action::EnterSucceeded => {
                         self.mode = Mode::Epr;
+                        self.device_policy_manager.epr_mode_changed(true).await;
                         State::EprWaitForCapabilities(*power_source)
                     }
-                    Action::Exit => State::EprExitReceived(*power_source),
-                    Action::EnterFailed => {
-                        // Per spec 8.3.3.26.2.1: EnterFailed → Soft Reset
-                        // Notify DPM of the failure reason before soft reset
-                        let reason = epr_mode::DataEnterFailed::from(epr_mode.data());
-                        self.device_policy_manager.epr_mode_entry_failed(reason).await;
+                    Either::Second(Ok(mode)) if mode.action() == Action::EnterFailed => {
+                        self.device_policy_manager
+                            .epr_mode_entry_failed(epr_mode::DataEnterFailed::from(mode.data()))
+                            .await;
                         State::SendSoftReset
                     }
-                    // Per spec 8.3.3.26.2.1: any other EPR_Mode message → Soft Reset
-                    _ => State::SendSoftReset,
-                }
-            }
-            State::EprEntryWaitForResponse(power_source) => {
-                // Wait for EnterSucceeded after receiving EnterAcknowledged.
-                // Per spec 8.3.3.26.2.2 (PE_SNK_EPR_Mode_Wait_For_Response), use SinkEPREnterTimer
-                // for the overall timeout while source performs cable discovery.
-                let message = self
-                    .protocol_layer
-                    .receive_message_type(&[MessageType::Data(DataMessageType::EprMode)], TimerType::SinkEPREnter)
-                    .await?;
-
-                let Some(Payload::Data(Data::EprMode(epr_mode))) = message.payload else {
-                    self.state = State::SendSoftReset;
-                    return Ok(());
-                };
-
-                match epr_mode.action() {
-                    Action::EnterSucceeded => {
-                        // EPR mode entry succeeded. Per spec Table 8.39 step 21-29,
-                        // source will automatically send EPR_Source_Capabilities after this.
-                        self.mode = Mode::Epr;
-                        State::EprWaitForCapabilities(*power_source)
+                    Either::Second(Err(error))
+                        if !matches!(
+                            error,
+                            ProtocolError::UnexpectedMessage | ProtocolError::RxError(RxError::ReceiveTimeout)
+                        ) =>
+                    {
+                        return Err(error.into());
                     }
-                    Action::Exit => State::EprExitReceived(*power_source),
-                    Action::EnterFailed => {
-                        // Per spec 8.3.3.26.2.2: EnterFailed → Soft Reset
-                        // Notify DPM of the failure reason before soft reset
-                        let reason = epr_mode::DataEnterFailed::from(epr_mode.data());
-                        self.device_policy_manager.epr_mode_entry_failed(reason).await;
+                    _ => {
+                        self.device_policy_manager.epr_mode_entry_aborted(false).await;
                         State::SendSoftReset
                     }
-                    // Per spec 8.3.3.26.2.2: any other EPR_Mode message → Soft Reset
-                    _ => State::SendSoftReset,
                 }
             }
             State::EprWaitForCapabilities(_power_source) => {
                 // After successful EPR mode entry, source automatically sends EPR_Source_Capabilities.
                 // This may be a chunked extended message that requires assembly.
                 // Wait for the capabilities and evaluate them.
-                let message = self.protocol_layer.wait_for_source_capabilities().await?;
+                let message = self
+                    .protocol_layer
+                    .receive_message_type(
+                        &[MessageType::Extended(ExtendedMessageType::EprSourceCapabilities)],
+                        TimerType::SinkWaitCap,
+                    )
+                    .await?;
 
                 match message.payload {
-                    Some(Payload::Data(Data::SourceCapabilities(capabilities))) => {
-                        State::EvaluateCapabilities(capabilities)
-                    }
                     Some(Payload::Extended(extended::Extended::EprSourceCapabilities(pdos))) => {
-                        State::EvaluateCapabilities(SourceCapabilities(pdos))
+                        let capabilities = SourceCapabilities(pdos);
+                        if capabilities.has_epr_pdo_in_spr_positions() {
+                            State::HardReset
+                        } else {
+                            State::EvaluateCapabilities(capabilities)
+                        }
                     }
                     _ => {
                         error!("Expected source capabilities after EPR mode entry");
@@ -1222,6 +1241,7 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                 // Inform partner we are exiting EPR.
                 self.protocol_layer.transmit_epr_mode(Action::Exit, 0).await?;
                 self.mode = Mode::Spr;
+                self.device_policy_manager.epr_mode_changed(false).await;
                 State::WaitForCapabilities
             }
             State::EprExitReceived(power_source) => {
@@ -1245,6 +1265,7 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                 if is_epr_pdo_contract {
                     State::HardReset
                 } else {
+                    self.device_policy_manager.epr_mode_changed(false).await;
                     State::WaitForCapabilities
                 }
             }
@@ -1274,12 +1295,13 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                                 self.mode = Mode::Epr;
                                 State::Ready(*power_source, false)
                             } else {
-                                State::SendNotSupported(*power_source)
+                                State::SendSoftReset
                             }
                         } else {
-                            State::SendNotSupported(*power_source)
+                            State::SendSoftReset
                         }
                     }
+                    Err(ProtocolError::RxError(RxError::HardReset)) => State::TransitionToDefault,
                     Err(_) => State::HardReset,
                 }
             }

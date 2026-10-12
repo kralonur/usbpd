@@ -313,7 +313,8 @@ async fn test_epr_negotiation() {
         "EPR EnterAcknowledged bytes should match capture"
     );
 
-    // EprModeEntry: sends EPR_Mode (Enter), receives EnterAcknowledged -> EprEntryWaitForResponse
+    // Ack and Succeeded share one continuously timed entry exchange.
+    let epr_enter_succeeded_bytes = simulate_source_epr_mode_message(&mut policy_engine, Action::EnterSucceeded, 5);
     match policy_engine.run_step().await {
         Ok(_) => eprintln!("EprModeEntry run_step succeeded"),
         Err(e) => eprintln!("EprModeEntry run_step failed: {:?}", e),
@@ -347,11 +348,6 @@ async fn test_epr_negotiation() {
 
     // Inject EPR_Mode (EnterSucceeded) using proper API
     // From capture line 85-88: RAW[6]: AA 1B 00 00 00 03 (Source, msg_id=5)
-    let epr_enter_succeeded_bytes = simulate_source_epr_mode_message(
-        &mut policy_engine,
-        Action::EnterSucceeded,
-        5, // message_id from capture
-    );
     // Assert bytes match the real capture
     assert_eq!(
         &epr_enter_succeeded_bytes[..],
@@ -359,8 +355,8 @@ async fn test_epr_negotiation() {
         "EPR EnterSucceeded bytes should match capture"
     );
 
-    // EprEntryWaitForResponse receives EnterSucceeded -> EprWaitForCapabilities
-    policy_engine.run_step().await.unwrap();
+    // The single entry exchange reached EprWaitForCapabilities.
+    assert!(matches!(policy_engine.state, State::EprWaitForCapabilities(_)));
     eprintln!("State after EnterSucceeded: {:?}", policy_engine.state);
 
     // Probe GoodCRC for EnterSucceeded
@@ -689,19 +685,47 @@ async fn malformed_epr_mode_responses_soft_reset_without_panicking() {
     for waiting in [false, true] {
         let mut engine = ready_engine::<true>();
         let established = engine.established_request.unwrap();
-        engine.state = if waiting {
-            State::EprEntryWaitForResponse(established)
-        } else {
-            State::EprModeEntry(established, crate::units::Power::new::<watt>(140))
-        };
-        if !waiting {
-            simulate_source_control_message(&mut engine, ControlMessageType::GoodCRC, 0);
+        engine.state = State::EprModeEntry(established, crate::units::Power::new::<watt>(140));
+        simulate_source_control_message(&mut engine, ControlMessageType::GoodCRC, 0);
+        if waiting {
+            simulate_source_epr_mode_message(&mut engine, Action::EnterAcknowledged, 0);
         }
         // An EPR_Mode header with no data object parses as Data::Unknown.
         inject(&mut engine, source_header(10, 1, 1, false), &[]);
         engine.run_step().await.unwrap();
         std::assert!(matches!(engine.state, State::SendSoftReset));
     }
+}
+
+// A reserved wire action/reason must not panic in the EPR state machine.
+#[tokio::test]
+async fn epr_entry_handles_reserved_actions_and_failure_reasons() {
+    for action in [Action::Reserved(0), Action::Reserved(255), Action::EnterFailed] {
+        let mut engine = ready_engine::<true>();
+        let established = engine.established_request.unwrap();
+        engine.state = State::EprModeEntry(established, crate::units::Power::new::<uom::si::power::watt>(140));
+        simulate_source_control_message(&mut engine, ControlMessageType::GoodCRC, 0);
+        let object = crate::protocol_layer::message::data::epr_mode::EprModeDataObject(0)
+            .with_action(action)
+            .with_data(255)
+            .0;
+        inject(&mut engine, source_header(10, 1, 1, false), &object.to_le_bytes());
+        engine.run_step().await.unwrap();
+        assert!(matches!(engine.state, State::SendSoftReset));
+    }
+}
+
+// Prevent raising VBUS when a source skips the mandatory entry acknowledgement.
+#[tokio::test]
+async fn epr_entry_requires_ack_before_succeeded() {
+    let mut engine = ready_engine::<true>();
+    let established = engine.established_request.unwrap();
+    engine.state = State::EprModeEntry(established, crate::units::Power::new::<uom::si::power::watt>(140));
+    simulate_source_control_message(&mut engine, ControlMessageType::GoodCRC, 0);
+    simulate_source_epr_mode_message(&mut engine, Action::EnterSucceeded, 1);
+    engine.run_step().await.unwrap();
+    assert!(matches!(engine.state, State::SendSoftReset));
+    assert_eq!(engine.mode, super::Mode::Spr);
 }
 
 #[tokio::test]

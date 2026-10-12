@@ -53,6 +53,13 @@ pub enum Event {
     SendSinkAlert(u32),
 }
 
+impl Event {
+    /// Enter with the SKEDB operational PDP in whole watts (section 6.4.10).
+    pub fn enter_epr_mode(operational_pdp_w: u8) -> Self {
+        Self::EnterEprMode(Power::new::<uom::si::power::watt>(u32::from(operational_pdp_w)))
+    }
+}
+
 /// A Sink-initiated information request from PE_SNK_Ready. Each sends one
 /// Message, runs SenderResponseTimer and returns to Ready on the answer or the
 /// timeout.
@@ -272,6 +279,24 @@ pub trait DevicePolicyManager {
     fn sink_capabilities(&self) -> sink_capabilities::SinkCapabilities {
         // Default: 5V @ 100mA (1A = 100 * 10mA)
         sink_capabilities::SinkCapabilities::new_vsafe5v_only(100)
+    }
+
+    /// EPR Sink_Capabilities, including zero padding through position seven
+    /// and EPR objects starting at position eight (section 6.5.15.1).
+    /// This is separate from the seven-object SPR advertisement.
+    fn epr_sink_capabilities(&self) -> sink_capabilities::SinkCapabilities {
+        self.sink_capabilities()
+    }
+
+    /// Successful EPR mode entry or commanded exit. Hard Reset is reported
+    /// through `hard_reset` instead; Soft Reset does not leave EPR mode.
+    fn epr_mode_changed(&mut self, _active: bool) -> impl Future<Output = ()> {
+        async {}
+    }
+
+    /// Entry ended without a source failure reason (timeout or unsent Enter).
+    fn epr_mode_entry_aborted(&mut self, _deferred: bool) -> impl Future<Output = ()> {
+        async {}
     }
 
     /// The policy engine gets and evaluates device policy events when ready.

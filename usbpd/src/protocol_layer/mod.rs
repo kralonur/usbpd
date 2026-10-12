@@ -41,6 +41,9 @@ const MSG_HEADER_SIZE: usize = 2;
 
 /// Size of the extended message header in bytes.
 const EXT_HEADER_SIZE: usize = 2;
+/// Chunk payload ceiling and EPR capability positions (sections 6.12.2, 6.5.15.1).
+const CHUNK_DATA_SIZE: usize = 26;
+const EPR_CAPABILITIES_OBJECTS: usize = 11;
 
 /// Errors that can occur in the protocol layer.
 #[derive(thiserror::Error, Debug)]
@@ -421,7 +424,12 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
 
         let mut buffer = Self::get_message_buffer();
         let size = message.to_bytes(&mut buffer);
+        self.transmit_bytes(&buffer[..size]).await
+    }
 
+    /// One encoded frame, using the same retry and MessageID rules as normal TX.
+    async fn transmit_bytes(&mut self, buffer: &[u8]) -> Result<(), ProtocolError> {
+        let size = buffer.len();
         if DRIVER::HAS_AUTO_RETRY {
             // Hardware handles retries and verifies GoodCRC reception.
             // Call driver.transmit() directly (not transmit_inner()) because
@@ -1049,6 +1057,10 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
         capabilities: message::data::sink_capabilities::SinkCapabilities,
     ) -> Result<(), ProtocolError> {
         let num_objects = capabilities.num_objects();
+        // SPR headers cannot encode more than seven objects.
+        if num_objects > 7 {
+            return Err(ProtocolError::UnexpectedMessage);
+        }
         let header = Header::new_data(
             self.default_header,
             self.counters.tx_message,
@@ -1068,21 +1080,67 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
         &mut self,
         capabilities: message::data::sink_capabilities::SinkCapabilities,
     ) -> Result<(), ProtocolError> {
-        // Convert SinkCapabilities PDOs to the extended message format
-        let pdos: heapless::Vec<_, 7> = capabilities.0.iter().cloned().collect();
-        let extended_payload = message::extended::Extended::EprSinkCapabilities(pdos);
+        let mut block = [0; EPR_CAPABILITIES_OBJECTS * core::mem::size_of::<u32>()];
+        let size = capabilities.to_bytes(&mut block);
+        if size == 0 {
+            return Err(ProtocolError::UnexpectedMessage);
+        }
+        for (chunk, carried) in block[..size].chunks(CHUNK_DATA_SIZE).enumerate() {
+            if chunk > 0 {
+                self.receive_epr_sink_chunk_request(chunk as u8).await?;
+            }
+            let objects = (EXT_HEADER_SIZE + carried.len()).div_ceil(core::mem::size_of::<u32>());
+            let header = Header::new_extended(
+                self.default_header,
+                self.counters.tx_message,
+                ExtendedMessageType::EprSinkCapabilities,
+                objects as u8,
+            );
+            let extended = message::extended::ExtendedHeader::new(size as u16)
+                .with_chunked(true)
+                .with_chunk_number(chunk as u8);
+            let mut bytes = [0; MSG_HEADER_SIZE + EXT_HEADER_SIZE + CHUNK_DATA_SIZE];
+            header.to_bytes(&mut bytes);
+            extended.to_bytes(&mut bytes[MSG_HEADER_SIZE..]);
+            let start = MSG_HEADER_SIZE + EXT_HEADER_SIZE;
+            bytes[start..start + carried.len()].copy_from_slice(carried);
+            self.transmit_bytes(&bytes[..MSG_HEADER_SIZE + objects * core::mem::size_of::<u32>()])
+                .await?;
+        }
+        Ok(())
+    }
 
-        let header = Header::new_extended(
-            self.default_header,
-            self.counters.tx_message,
-            ExtendedMessageType::EprSinkCapabilities,
-            0, // num_objects is Reserved (0) for unchunked extended messages per spec 6.2.1.1.2
-        );
-
-        let mut message = Message::new(header);
-        message.payload = Some(Payload::Extended(extended_payload));
-
-        self.transmit(message).await
+    /// Wait for and acknowledge the requested next Chunk, without feeding a
+    /// Chunk Request into the received-data assembler (section 6.12.2.1.1).
+    async fn receive_epr_sink_chunk_request(&mut self, chunk: u8) -> Result<(), ProtocolError> {
+        let receive = async {
+            loop {
+                let mut bytes = [0; MSG_HEADER_SIZE + EXT_HEADER_SIZE + CHUNK_DATA_SIZE];
+                let len = self.driver.receive(&mut bytes).await.map_err(|error| match error {
+                    DriverRxError::HardReset => RxError::HardReset,
+                    DriverRxError::Discarded => RxError::UnsupportedMessage,
+                })?;
+                let frame = bytes.get(..len).ok_or(RxError::UnsupportedMessage)?;
+                let (header, extended, _) = Message::parse_extended_chunk(frame).map_err(RxError::from)?;
+                if header.message_type() != MessageType::Extended(ExtendedMessageType::EprSinkCapabilities)
+                    || !extended.chunked()
+                    || !extended.request_chunk()
+                    || extended.chunk_number() != chunk
+                    || extended.data_size() != 0
+                    || header.num_objects() != 1
+                {
+                    return Err(ProtocolError::UnexpectedMessage);
+                }
+                self.detect_revision(header)?;
+                if !self.handle_rx_ack(&Message::new(header)).await? {
+                    return Ok(());
+                }
+            }
+        };
+        match select(TimerType::get_timer::<TIMER>(TimerType::ChunkSenderRequest), receive).await {
+            Either::First(_) => Err(RxError::ReceiveTimeout.into()),
+            Either::Second(result) => result,
+        }
     }
 
     /// Transmit the device's Source Capabilities

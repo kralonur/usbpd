@@ -46,7 +46,7 @@ pub enum Extended {
     /// EPR source capabilities list.
     EprSourceCapabilities(Vec<PowerDataObject, 16>),
     /// EPR sink capabilities list.
-    EprSinkCapabilities(Vec<SinkPowerDataObject, 7>),
+    EprSinkCapabilities(Vec<SinkPowerDataObject, 11>),
     /// Sink Capabilities Extended Data Block (SKEDB, Table 6.61), raw bytes.
     SinkCapabilitiesExtended([u8; 24]),
     /// PPS Status Data Block (PPSSDB, Table 6.58), raw bytes.

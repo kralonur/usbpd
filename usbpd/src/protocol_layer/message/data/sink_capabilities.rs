@@ -298,6 +298,8 @@ pub enum SinkPowerDataObject {
     Pps(SprPps),
     /// SPR AVS requirement (Table 6.15).
     SprAvs(SprAvs),
+    /// EPR AVS APDO (section 6.4.1.3.4.3), raw representation.
+    EprAvs(u32),
 }
 
 impl SinkPowerDataObject {
@@ -309,12 +311,13 @@ impl SinkPowerDataObject {
             SinkPowerDataObject::VariableSupply(v) => v.0,
             SinkPowerDataObject::Pps(p) => p.0,
             SinkPowerDataObject::SprAvs(a) => a.0,
+            SinkPowerDataObject::EprAvs(raw) => *raw,
         }
     }
 }
 
-/// Maximum 7 PDOs for SPR mode
-const MAX_CAPABILITIES_LEN: usize = 7;
+/// Seven SPR positions followed by up to four EPR objects (section 6.5.15.1).
+const MAX_CAPABILITIES_LEN: usize = 11;
 
 /// Sink capabilities message content.
 ///

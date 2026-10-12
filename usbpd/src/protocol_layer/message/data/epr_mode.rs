@@ -7,6 +7,8 @@ use proc_bitfield::bitfield;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Action {
+    /// Reserved action received on the wire; policy rejects it without panicking.
+    Reserved(u8),
     /// Enter EPR mode.
     Enter,
     /// Entering EPR mode was acknowledged.
@@ -22,6 +24,7 @@ pub enum Action {
 impl From<Action> for u8 {
     fn from(value: Action) -> Self {
         match value {
+            Action::Reserved(raw) => raw,
             Action::Enter => 0x01,
             Action::EnterAcknowledged => 0x02,
             Action::EnterSucceeded => 0x03,
@@ -39,7 +42,7 @@ impl From<u8> for Action {
             0x03 => Action::EnterSucceeded,
             0x04 => Action::EnterFailed,
             0x05 => Action::Exit,
-            _ => panic!("Cannot convert {} to Action", value), // Illegal values shall panic.
+            _ => Action::Reserved(value),
         }
     }
 }
@@ -70,6 +73,8 @@ impl Default for EprModeDataObject {
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum DataEnterFailed {
+    /// Reserved reason received on the wire, preserved for diagnostics.
+    Reserved(u8),
     /// Unknown cause.
     UnknownCause,
     /// The cable is not EPR capable.
@@ -89,6 +94,7 @@ pub enum DataEnterFailed {
 impl From<DataEnterFailed> for u8 {
     fn from(value: DataEnterFailed) -> Self {
         match value {
+            DataEnterFailed::Reserved(raw) => raw,
             DataEnterFailed::UnknownCause => 0x00,
             DataEnterFailed::CableNotEprCapable => 0x01,
             DataEnterFailed::SourceFailedToBecomeVconnSource => 0x02,
@@ -108,7 +114,7 @@ impl From<u8> for DataEnterFailed {
             0x03 => DataEnterFailed::EprCapableBitNotSetInRdo,
             0x04 => DataEnterFailed::SourceUnableToEnterEprMode,
             0x05 => DataEnterFailed::EprCapableBitNotSetInPdo,
-            _ => panic!("Cannot convert {} to DataEnterFailed", value), // Illegal values shall panic.
+            _ => DataEnterFailed::Reserved(value),
         }
     }
 }
