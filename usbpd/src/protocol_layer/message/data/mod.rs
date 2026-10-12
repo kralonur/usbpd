@@ -85,9 +85,11 @@ impl Data {
         message.payload = Some(Payload::Data(match message_type {
             DataMessageType::SourceCapabilities => Data::SourceCapabilities(source_capabilities::SourceCapabilities(
                 payload
-                    .chunks_exact(PDO_SIZE)
+                    .as_chunks::<PDO_SIZE>()
+                    .0
+                    .iter()
                     .take(message.header.num_objects())
-                    .map(|buf| source_capabilities::parse_raw_pdo(LittleEndian::read_u32(buf)))
+                    .map(|buf| source_capabilities::parse_raw_pdo(u32::from_le_bytes(*buf)))
                     .collect(),
             )),
             DataMessageType::Request => {
@@ -143,9 +145,11 @@ impl Data {
             DataMessageType::Revision if len >= PDO_SIZE => Data::Revision(LittleEndian::read_u32(payload)),
             DataMessageType::SourceInfo if len >= PDO_SIZE => Data::SourceInfo(
                 payload
-                    .chunks_exact(PDO_SIZE)
+                    .as_chunks::<PDO_SIZE>()
+                    .0
+                    .iter()
                     .take(message.header.num_objects().min(2))
-                    .map(LittleEndian::read_u32)
+                    .map(|buf| u32::from_le_bytes(*buf))
                     .collect(),
             ),
             DataMessageType::Bist if len >= PDO_SIZE => Data::Bist(LittleEndian::read_u32(payload)),
@@ -170,9 +174,11 @@ impl Data {
                     };
 
                     let data = payload[PDO_SIZE..]
-                        .chunks_exact(PDO_SIZE)
+                        .as_chunks::<PDO_SIZE>()
+                        .0
+                        .iter()
                         .take(7)
-                        .map(LittleEndian::read_u32)
+                        .map(|buf| u32::from_le_bytes(*buf))
                         .collect::<Vec<u32, 7>>();
 
                     trace!("VDM RX: {:?} {:?}", header, data);
@@ -226,8 +232,8 @@ impl Data {
                 PDO_SIZE
             }
             Self::SourceInfo(objects) => {
-                for (chunk, object) in payload.chunks_exact_mut(PDO_SIZE).zip(objects) {
-                    LittleEndian::write_u32(chunk, *object);
+                for (chunk, object) in payload.as_chunks_mut::<PDO_SIZE>().0.iter_mut().zip(objects) {
+                    *chunk = object.to_le_bytes();
                 }
                 objects.len() * PDO_SIZE
             }

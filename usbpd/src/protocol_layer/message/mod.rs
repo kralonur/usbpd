@@ -143,11 +143,13 @@ impl Message {
             }
             header::ExtendedMessageType::EprSourceCapabilities => extended::Extended::EprSourceCapabilities(
                 payload
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|buf| {
-                        crate::protocol_layer::message::data::source_capabilities::parse_raw_pdo(
-                            LittleEndian::read_u32(buf),
-                        )
+                        crate::protocol_layer::message::data::source_capabilities::parse_raw_pdo(u32::from_le_bytes(
+                            *buf,
+                        ))
                     })
                     .collect(),
             ),
@@ -237,10 +239,12 @@ impl Message {
                         header::ExtendedMessageType::EprSourceCapabilities => {
                             extended::Extended::EprSourceCapabilities(
                                 payload_bytes
-                                    .chunks_exact(4)
+                                    .as_chunks::<4>()
+                                    .0
+                                    .iter()
                                     .map(|buf| {
                                         crate::protocol_layer::message::data::source_capabilities::parse_raw_pdo(
-                                            LittleEndian::read_u32(buf),
+                                            u32::from_le_bytes(*buf),
                                         )
                                     })
                                     .collect(),

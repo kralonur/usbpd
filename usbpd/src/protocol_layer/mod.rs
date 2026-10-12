@@ -15,7 +15,6 @@ pub mod message;
 use core::future::Future;
 use core::marker::PhantomData;
 
-use byteorder::{ByteOrder, LittleEndian};
 use embassy_futures::select::{Either, select};
 use heapless::{Deque, Vec};
 use message::Message;
@@ -652,9 +651,11 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
                         ExtendedMessageType::EprSourceCapabilities => {
                             Payload::Extended(message::extended::Extended::EprSourceCapabilities(
                                 ext_payload
-                                    .chunks_exact(4)
+                                    .as_chunks::<4>()
+                                    .0
+                                    .iter()
                                     .map(|buf| {
-                                        message::data::source_capabilities::parse_raw_pdo(LittleEndian::read_u32(buf))
+                                        message::data::source_capabilities::parse_raw_pdo(u32::from_le_bytes(*buf))
                                     })
                                     .collect(),
                             ))
