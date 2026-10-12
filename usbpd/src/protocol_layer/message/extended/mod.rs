@@ -102,6 +102,7 @@ impl Extended {
                         PowerDataObject::Augmented(a) => match a {
                             crate::protocol_layer::message::data::source_capabilities::Augmented::Spr(p) => p.0,
                             crate::protocol_layer::message::data::source_capabilities::Augmented::Epr(p) => p.0,
+                            crate::protocol_layer::message::data::source_capabilities::Augmented::SprAvs(p) => p.0,
                             crate::protocol_layer::message::data::source_capabilities::Augmented::Unknown(p) => *p,
                         },
                         PowerDataObject::Unknown(p) => p.0,

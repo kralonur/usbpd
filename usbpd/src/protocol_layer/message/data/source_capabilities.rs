@@ -62,6 +62,7 @@ impl PowerDataObject {
             PowerDataObject::Augmented(a) => match a {
                 Augmented::Spr(s) => s.0,
                 Augmented::Epr(e) => e.0,
+                Augmented::SprAvs(a) => a.0,
                 Augmented::Unknown(u) => *u,
             },
             PowerDataObject::Unknown(u) => u.0,
@@ -217,6 +218,8 @@ pub enum Augmented {
     Spr(SprProgrammablePowerSupply),
     /// EPR AVS
     Epr(EprAdjustableVoltageSupply),
+    /// SPR AVS
+    SprAvs(SprAdjustableVoltageSupply),
     /// Unknown
     Unknown(u32),
 }
@@ -315,6 +318,69 @@ impl EprAdjustableVoltageSupply {
     /// Rated power the PPS can supply
     pub fn pd_power(&self) -> Power {
         Power::new::<watt>(self.raw_pd_power().into())
+    }
+}
+
+bitfield! {
+    /// SPR AVS APDO, see PD Spec R3.2 Table 6.15
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+    pub struct SprAdjustableVoltageSupply(pub u32): Debug, FromStorage, IntoStorage {
+        /// Augmented power data object
+        pub kind: u8 @ 30..=31,
+        /// SPR adjustable voltage supply
+        pub supply: u8 @ 28..=29,
+        /// Peak current capability during the Overload Period
+        pub peak_current: u8 @ 26..=27,
+        /// Maximum current from 9 V to 15 V in 10 mA increments
+        pub raw_max_current_15v: u16 @ 10..=19,
+        /// Maximum current from 15 V to 20 V in 10 mA increments, 0 when the range ends at 15 V
+        pub raw_max_current_20v: u16 @ 0..=9,
+    }
+}
+
+impl SprAdjustableVoltageSupply {
+    /// SPR AVS minimum voltage, in volts (PD Spec R3.2 Table 4.3).
+    const MIN_VOLTAGE_V: u32 = 9;
+    /// SPR AVS maximum voltage of the 15 V range, in volts (PD Spec R3.2 Table 4.3).
+    const MAX_VOLTAGE_15V_RANGE_V: u32 = 15;
+    /// SPR AVS maximum voltage of the 20 V range, in volts (PD Spec R3.2 Table 4.3).
+    const MAX_VOLTAGE_20V_RANGE_V: u32 = 20;
+
+    /// The minimum voltage the AVS can be requested to supply
+    pub fn min_voltage(&self) -> ElectricPotential {
+        ElectricPotential::new::<volt>(Self::MIN_VOLTAGE_V)
+    }
+
+    /// The maximum voltage the AVS can be requested to supply: 20 V when it
+    /// advertises a 15-20 V current, otherwise 15 V (PD Spec R3.2 Table 6.15)
+    pub fn max_voltage(&self) -> ElectricPotential {
+        if self.raw_max_current_20v() == 0 {
+            ElectricPotential::new::<volt>(Self::MAX_VOLTAGE_15V_RANGE_V)
+        } else {
+            ElectricPotential::new::<volt>(Self::MAX_VOLTAGE_20V_RANGE_V)
+        }
+    }
+
+    /// The maximum current from 9 V to 15 V
+    pub fn max_current_15v(&self) -> ElectricCurrent {
+        ElectricCurrent::new::<centiampere>(self.raw_max_current_15v().into())
+    }
+
+    /// The maximum current from 15 V to 20 V
+    pub fn max_current_20v(&self) -> ElectricCurrent {
+        ElectricCurrent::new::<centiampere>(self.raw_max_current_20v().into())
+    }
+
+    /// The maximum current at `voltage`: the 15 V current up to 15 V, the
+    /// 20 V current above it (PD Spec R3.2 Table 6.15)
+    pub fn max_current_at(&self, voltage: ElectricPotential) -> ElectricCurrent {
+        if voltage <= ElectricPotential::new::<volt>(Self::MAX_VOLTAGE_15V_RANGE_V) {
+            self.max_current_15v()
+        } else {
+            self.max_current_20v()
+        }
     }
 }
 
@@ -477,7 +543,7 @@ impl PdoKind for SourceCapabilities {
                 PowerDataObject::VariableSupply(_) => Some(Kind::VariableSupply),
                 PowerDataObject::Augmented(augmented) => match augmented {
                     Augmented::Spr(_) => Some(Kind::Pps),
-                    Augmented::Epr(_) => Some(Kind::Avs),
+                    Augmented::Epr(_) | Augmented::SprAvs(_) => Some(Kind::Avs),
                     Augmented::Unknown(_) => None,
                 },
                 PowerDataObject::Unknown(_) => None,
@@ -510,6 +576,7 @@ pub fn parse_raw_pdo(raw: u32) -> PowerDataObject {
         0b11 => PowerDataObject::Augmented(match AugmentedRaw(raw).supply() {
             0b00 => Augmented::Spr(SprProgrammablePowerSupply(raw)),
             0b01 => Augmented::Epr(EprAdjustableVoltageSupply(raw)),
+            0b10 => Augmented::SprAvs(SprAdjustableVoltageSupply(raw)),
             x => {
                 warn!("Unknown AugmentedPowerDataObject supply {}", x);
                 Augmented::Unknown(raw)
@@ -519,5 +586,27 @@ pub fn parse_raw_pdo(raw: u32) -> PowerDataObject {
             warn!("Unknown PowerDataObject kind");
             PowerDataObject::Unknown(pdo)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // An SPR AVS APDO must not decode as PPS or EPR AVS: its RDO and voltage
+    // range differ, so a misread object would be requested wrongly.
+    #[test]
+    fn parses_spr_avs_apdo() {
+        // SPR AVS, 3.00 A from 9-15 V, 2.25 A from 15-20 V (PD Spec R3.2 Table 6.15).
+        let PowerDataObject::Augmented(Augmented::SprAvs(avs)) = parse_raw_pdo(0xe004_b0e1) else {
+            panic!("expected an SPR AVS APDO");
+        };
+        assert_eq!(avs.min_voltage(), ElectricPotential::new::<volt>(9));
+        assert_eq!(avs.max_voltage(), ElectricPotential::new::<volt>(20));
+        assert_eq!(
+            avs.max_current_at(avs.max_voltage()),
+            ElectricCurrent::new::<centiampere>(225)
+        );
+        assert_eq!(avs.max_current_15v(), ElectricCurrent::new::<centiampere>(300));
     }
 }

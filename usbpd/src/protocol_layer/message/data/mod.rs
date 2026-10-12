@@ -219,6 +219,7 @@ impl Data {
                     source_capabilities::PowerDataObject::Augmented(a) => match a {
                         source_capabilities::Augmented::Spr(p) => p.0,
                         source_capabilities::Augmented::Epr(p) => p.0,
+                        source_capabilities::Augmented::SprAvs(p) => p.0,
                         source_capabilities::Augmented::Unknown(p) => *p,
                     },
                     source_capabilities::PowerDataObject::Unknown(p) => p.0,
