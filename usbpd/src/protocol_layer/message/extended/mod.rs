@@ -95,18 +95,7 @@ impl Extended {
             Self::EprSourceCapabilities(pdos) => {
                 let mut written = 0;
                 for pdo in pdos {
-                    let raw = match pdo {
-                        PowerDataObject::FixedSupply(p) => p.0,
-                        PowerDataObject::Battery(p) => p.0,
-                        PowerDataObject::VariableSupply(p) => p.0,
-                        PowerDataObject::Augmented(a) => match a {
-                            crate::protocol_layer::message::data::source_capabilities::Augmented::Spr(p) => p.0,
-                            crate::protocol_layer::message::data::source_capabilities::Augmented::Epr(p) => p.0,
-                            crate::protocol_layer::message::data::source_capabilities::Augmented::SprAvs(p) => p.0,
-                            crate::protocol_layer::message::data::source_capabilities::Augmented::Unknown(p) => *p,
-                        },
-                        PowerDataObject::Unknown(p) => p.0,
-                    };
+                    let raw = pdo.to_raw();
                     LittleEndian::write_u32(&mut payload[written..written + 4], raw);
                     written += 4;
                 }
