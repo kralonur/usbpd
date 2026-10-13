@@ -1017,6 +1017,31 @@ async fn deferred_get_source_cap_returns_to_ready_instead_of_sending_again() {
     std::assert!(engine.protocol_layer.driver().tx.is_empty());
 }
 
+// A Hard Reset here would drop an EPR voltage for a Message the Source's own
+// traffic merely Discarded (section 8.3.3.1); Ready retries it instead.
+#[tokio::test]
+async fn deferred_epr_keep_alive_or_exit_returns_to_ready_in_epr_mode() {
+    use crate::protocol_layer::message::data::request::FixedVariableSupply;
+    let established = PowerSource::FixedVariableSupply(FixedVariableSupply(0x1000_280a));
+    for state in [State::EprKeepAlive(established), State::EprSendExit(established)] {
+        let mut engine: Sink<DeferringDriver, DummyTimer, DeferredRecorder> = Sink::new(
+            DeferringDriver {
+                defer: 1,
+                tx: std::vec::Vec::new(),
+            },
+            DeferredRecorder::default(),
+        );
+        engine.contract = super::Contract::Explicit;
+        engine.established_request = Some(established);
+        engine.mode = super::Mode::Epr;
+        engine.state = state;
+        engine.run_step().await.unwrap();
+        std::assert!(matches!(engine.state, State::Ready(_, false)));
+        std::assert!(engine.mode == super::Mode::Epr);
+        std::assert!(engine.protocol_layer.driver().tx.is_empty());
+    }
+}
+
 #[tokio::test]
 async fn deferred_request_without_explicit_contract_is_not_turned_into_ready() {
     use crate::protocol_layer::message::data::request::FixedVariableSupply;

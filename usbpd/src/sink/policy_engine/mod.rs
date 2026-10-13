@@ -87,7 +87,7 @@ enum State {
     // EPR states
     EprModeEntry(request::PowerSource, units::Power),
     EprWaitForCapabilities(request::PowerSource),
-    EprSendExit,
+    EprSendExit(request::PowerSource),
     EprExitReceived(request::PowerSource),
     EprKeepAlive(request::PowerSource),
 }
@@ -233,6 +233,17 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                 self.state = State::Ready(power_source, false);
                 return Ok(());
             }
+            // Section 8.3.3.1: a Discarded first Message is retried after the
+            // incoming Message. Ready handles that Message, still in EPR Mode,
+            // and restarts SinkEPRKeepAliveTimer; the DPM asks to exit again.
+            if let (
+                State::EprKeepAlive(power_source) | State::EprSendExit(power_source),
+                ProtocolError::TransmitDeferred,
+            ) = (&self.state, &protocol_error)
+            {
+                self.state = State::Ready(*power_source, false);
+                return Ok(());
+            }
             let new_state = match (&self.mode, &self.state, protocol_error) {
                 // Handle when hard reset is signaled by the driver itself.
                 (_, _, ProtocolError::RxError(RxError::HardReset) | ProtocolError::TxError(TxError::HardReset)) => {
@@ -271,9 +282,6 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                     Some(State::SendSoftReset)
                 }
                 (_, State::EprWaitForCapabilities(_), _) => Some(State::HardReset),
-                (_, State::EprKeepAlive(_) | State::EprSendExit, ProtocolError::TransmitDeferred) => {
-                    Some(State::HardReset)
-                }
 
                 // Per spec 8.3.3.3.3: SinkWaitCapTimer timeout triggers Hard Reset.
                 (_, State::WaitForCapabilities, ProtocolError::RxError(RxError::ReceiveTimeout)) => {
@@ -680,7 +688,7 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                             State::EprModeEntry(*power_source, pdp)
                         }
                         Event::ExitEprMode if self.mode == Mode::Epr && power_source.object_position() <= 7 => {
-                            State::EprSendExit
+                            State::EprSendExit(*power_source)
                         }
                         Event::EnterEprMode(_) | Event::ExitEprMode => State::Ready(*power_source, false),
                         Event::RequestPower(power_source) => State::SelectCapability(power_source),
@@ -1237,7 +1245,7 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                     }
                 }
             }
-            State::EprSendExit => {
+            State::EprSendExit(_) => {
                 // Inform partner we are exiting EPR.
                 self.protocol_layer.transmit_epr_mode(Action::Exit, 0).await?;
                 self.mode = Mode::Spr;
