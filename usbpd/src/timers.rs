@@ -4,6 +4,13 @@
 pub trait Timer {
     /// Expire after the specified number of milliseconds.
     fn after_millis(milliseconds: u64) -> impl Future<Output = ()>;
+
+    /// Expire `timer_type` after its specified `milliseconds`. Override to treat
+    /// particular timers specially, matched by type rather than by duration.
+    fn after_timer(timer_type: TimerType, milliseconds: u64) -> impl Future<Output = ()> {
+        let _ = timer_type;
+        Self::after_millis(milliseconds)
+    }
 }
 
 use core::future::Future;
@@ -52,39 +59,40 @@ impl TimerType {
     ///
     /// Times out after a duration that is given by the USB PD specification.
     pub fn get_timer<TIMER: Timer>(timer_type: TimerType) -> impl Future<Output = ()> {
-        match timer_type {
-            TimerType::BISTContMode => TIMER::after_millis(45),
-            TimerType::ChunkingNotSupported => TIMER::after_millis(45),
-            TimerType::ChunkSenderRequest => TIMER::after_millis(27),
-            TimerType::ChunkSenderResponse => TIMER::after_millis(27),
-            TimerType::CRCReceive => TIMER::after_millis(1),
-            TimerType::DataResetFail => TIMER::after_millis(350),
-            TimerType::DataResetFailUFP => TIMER::after_millis(500),
-            TimerType::DiscoverIdentity => TIMER::after_millis(45),
-            TimerType::HardResetComplete => TIMER::after_millis(5),
-            TimerType::NoResponse => TIMER::after_millis(5000),
-            TimerType::PSHardReset => TIMER::after_millis(30),
-            TimerType::PSSourceOffSpr => TIMER::after_millis(835),
-            TimerType::PSSourceOffEpr => TIMER::after_millis(1260),
-            TimerType::PSSourceOnSpr => TIMER::after_millis(435),
-            TimerType::PSTransitionSpr => TIMER::after_millis(500),
-            TimerType::PSTransitionEpr => TIMER::after_millis(925),
-            TimerType::SenderResponse => TIMER::after_millis(usbpd_traits::SENDER_RESPONSE_MS),
-            TimerType::SinkEPREnter => TIMER::after_millis(500),
-            TimerType::SinkEPRKeepAlive => TIMER::after_millis(375),
-            TimerType::SinkPPSPeriodic => TIMER::after_millis(5000), // Max. 10 s
-            TimerType::SinkRequest => TIMER::after_millis(100),
-            TimerType::SinkWaitCap => TIMER::after_millis(465),
-            TimerType::SourceCapability => TIMER::after_millis(150),
-            TimerType::SourceEPRKeepAlive => TIMER::after_millis(875),
-            TimerType::SourcePPSComm => TIMER::after_millis(13500),
-            TimerType::SinkTx => TIMER::after_millis(18),
-            TimerType::SwapSourceStart => TIMER::after_millis(20),
-            TimerType::VCONNDischarge => TIMER::after_millis(200),
-            TimerType::VCONNOn => TIMER::after_millis(50),
-            TimerType::VDMModeEntry => TIMER::after_millis(45),
-            TimerType::VDMModeExit => TIMER::after_millis(45),
-            TimerType::VDMResponse => TIMER::after_millis(27),
-        }
+        let milliseconds = match timer_type {
+            TimerType::BISTContMode => 45,
+            TimerType::ChunkingNotSupported => 45,
+            TimerType::ChunkSenderRequest => 27,
+            TimerType::ChunkSenderResponse => 27,
+            TimerType::CRCReceive => 1,
+            TimerType::DataResetFail => 350,
+            TimerType::DataResetFailUFP => 500,
+            TimerType::DiscoverIdentity => 45,
+            TimerType::HardResetComplete => 5,
+            TimerType::NoResponse => 5000,
+            TimerType::PSHardReset => 30,
+            TimerType::PSSourceOffSpr => 835,
+            TimerType::PSSourceOffEpr => 1260,
+            TimerType::PSSourceOnSpr => 435,
+            TimerType::PSTransitionSpr => 500,
+            TimerType::PSTransitionEpr => 925,
+            TimerType::SenderResponse => usbpd_traits::SENDER_RESPONSE_MS,
+            TimerType::SinkEPREnter => 500,
+            TimerType::SinkEPRKeepAlive => 375,
+            TimerType::SinkPPSPeriodic => 5000, // Max. 10 s
+            TimerType::SinkRequest => 100,
+            TimerType::SinkWaitCap => 465,
+            TimerType::SourceCapability => 150,
+            TimerType::SourceEPRKeepAlive => 875,
+            TimerType::SourcePPSComm => 13500,
+            TimerType::SinkTx => 18,
+            TimerType::SwapSourceStart => 20,
+            TimerType::VCONNDischarge => 200,
+            TimerType::VCONNOn => 50,
+            TimerType::VDMModeEntry => 45,
+            TimerType::VDMModeExit => 45,
+            TimerType::VDMResponse => 27,
+        };
+        TIMER::after_timer(timer_type, milliseconds)
     }
 }
