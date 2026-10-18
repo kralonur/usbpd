@@ -94,6 +94,17 @@ impl Data {
                     .map(|buf| source_capabilities::parse_raw_pdo(u32::from_le_bytes(*buf)))
                     .collect(),
             )),
+            DataMessageType::SinkCapabilities if len > 0 && len == message.header.num_objects() * PDO_SIZE => {
+                Data::SinkCapabilities(sink_capabilities::SinkCapabilities::new(
+                    payload
+                        .as_chunks::<PDO_SIZE>()
+                        .0
+                        .iter()
+                        .take(message.header.num_objects())
+                        .map(|buf| sink_capabilities::parse_raw_pdo(u32::from_le_bytes(*buf)))
+                        .collect(),
+                ))
+            }
             DataMessageType::Request => {
                 if len != 4 {
                     Data::Unknown
@@ -243,7 +254,18 @@ impl Data {
                 }
                 objects.len() * PDO_SIZE
             }
-            Self::VendorDefined(_) => unimplemented!(),
+            Self::VendorDefined((header, objects)) => {
+                header.to_bytes(payload);
+                for (chunk, object) in payload[PDO_SIZE..]
+                    .as_chunks_mut::<PDO_SIZE>()
+                    .0
+                    .iter_mut()
+                    .zip(objects)
+                {
+                    chunk.copy_from_slice(&object.to_le_bytes());
+                }
+                PDO_SIZE * (1 + objects.len())
+            }
         }
     }
 }

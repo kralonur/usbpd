@@ -61,10 +61,14 @@ impl Event {
 }
 
 /// A Sink-initiated information request from PE_SNK_Ready. Each sends one
-/// Message, runs SenderResponseTimer and returns to Ready on the answer or the
-/// timeout.
+/// Message, runs SenderResponseTimer (VDMResponseTimer for identity), and
+/// returns to Ready on the answer or timeout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PartnerQuery {
+    /// Get_Sink_Cap -> the source-mode partner's SPR Sink_Capabilities.
+    SinkCapabilities,
+    /// SOP Structured VDM Discover Identity, without a data-role swap (PD3).
+    DiscoverIdentity,
     /// Get_Source_Cap_Extended -> Source_Capabilities_Extended
     /// (PE_SNK_Get_Source_Cap_Ext, section 9.2.9.1.1).
     SourceCapabilitiesExtended,
@@ -91,8 +95,13 @@ pub enum QueryOutcome {
     /// The answer's Data Block as received: the SCEDB (Table 6.50), the
     /// Manufacturer_Info block (Table 6.57), the SDB (Table 6.51), the BCDB
     /// (Table 6.55), or the RMDO (Table 6.31) / SIDO1 and SIDO2 (Tables 6.29,
-    /// 6.30) / BSDO (Table 6.24) in little-endian byte order.
-    Answer(heapless::Vec<u8, 26>),
+    /// 6.30) / BSDO (Table 6.24) in little-endian byte order. Port queries retain
+    /// up to seven PDOs or identity objects, including the structured VDM header.
+    Answer(heapless::Vec<u8, 28>),
+    /// The partner declined Structured VDM discovery with NAK.
+    Nak,
+    /// The partner answered Structured VDM discovery with BUSY; not retried.
+    Busy,
     /// The Source answered Not_Supported.
     NotSupported,
     /// SenderResponseTimer expired.

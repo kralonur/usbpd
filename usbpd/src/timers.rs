@@ -91,7 +91,7 @@ impl TimerType {
             TimerType::VCONNOn => 50,
             TimerType::VDMModeEntry => 45,
             TimerType::VDMModeExit => 45,
-            TimerType::VDMResponse => 27,
+            TimerType::VDMResponse => usbpd_traits::VDM_RESPONSE_MS,
         };
         TIMER::after_timer(timer_type, milliseconds)
     }

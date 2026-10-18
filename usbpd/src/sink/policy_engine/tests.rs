@@ -1508,6 +1508,8 @@ async fn a_protocol_error_while_power_transitions_hard_resets() {
     std::assert!(matches!(engine.state, State::HardReset));
 }
 
+mod port;
+
 /// Asks the queued information requests in order and records each outcome.
 #[derive(Default)]
 struct QueryRecorder {

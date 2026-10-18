@@ -300,6 +300,8 @@ pub enum SinkPowerDataObject {
     SprAvs(SprAvs),
     /// EPR AVS APDO (section 6.4.1.3.4.3), raw representation.
     EprAvs(u32),
+    /// Reserved APDO subtype, retained without interpreting its fields.
+    Unknown(u32),
 }
 
 impl SinkPowerDataObject {
@@ -311,8 +313,23 @@ impl SinkPowerDataObject {
             SinkPowerDataObject::VariableSupply(v) => v.0,
             SinkPowerDataObject::Pps(p) => p.0,
             SinkPowerDataObject::SprAvs(a) => a.0,
-            SinkPowerDataObject::EprAvs(raw) => *raw,
+            SinkPowerDataObject::EprAvs(raw) | SinkPowerDataObject::Unknown(raw) => *raw,
         }
+    }
+}
+
+/// Decode a Sink PDO using its own layouts, not Source PDO flags (Tables 6.14–6.19).
+pub fn parse_raw_pdo(raw: u32) -> SinkPowerDataObject {
+    match raw >> 30 {
+        0 => SinkPowerDataObject::FixedSupply(FixedSupply(raw)),
+        1 => SinkPowerDataObject::Battery(Battery(raw)),
+        2 => SinkPowerDataObject::VariableSupply(VariableSupply(raw)),
+        _ => match (raw >> 28) & 3 {
+            0 => SinkPowerDataObject::Pps(SprPps(raw)),
+            1 => SinkPowerDataObject::EprAvs(raw),
+            2 => SinkPowerDataObject::SprAvs(SprAvs(raw)),
+            _ => SinkPowerDataObject::Unknown(raw),
+        },
     }
 }
 

@@ -92,6 +92,9 @@ enum State {
     EprKeepAlive(request::PowerSource),
 }
 
+// SVDM 2.1 encoded in VDM Header bits 14..11 (Table 6.33).
+const INITIAL_SVDM_VERSION: u32 = 0x2800;
+
 /// Implementation of the sink policy engine.
 /// See spec, [8.3.3.3]
 #[derive(Debug)]
@@ -114,6 +117,8 @@ pub struct Sink<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> {
     /// (PS_RDY, Reject or Wait). A further Protocol Error then means the Soft
     /// Reset did not correct the error: Hard Reset (section 7.1.1).
     recovering: bool,
+    // Highest common SOP SVDM version, retained until detach (section 6.4.4.2.3).
+    partner_svdm_version: u32,
 
     _timer: PhantomData<TIMER>,
 }
@@ -157,6 +162,7 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
             established_request: None,
             wait_request: None,
             recovering: false,
+            partner_svdm_version: INITIAL_SVDM_VERSION,
             _timer: PhantomData,
         }
     }
@@ -164,6 +170,7 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
     /// Set a new driver when re-attached.
     pub fn re_attach(&mut self, driver: DRIVER) {
         self.protocol_layer = Self::new_protocol_layer(driver);
+        self.partner_svdm_version = INITIAL_SVDM_VERSION;
     }
 
     /// Run a single step in the policy engine state machine.
@@ -833,6 +840,18 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                 // Send the request, run SenderResponseTimer, return to Ready on the
                 // answer or the timeout (sections 9.2.9.1.1, 9.2.14.1.1, 9.2.16.1.1).
                 let answer = match query {
+                    PartnerQuery::SinkCapabilities => {
+                        self.protocol_layer
+                            .transmit_control_message(ControlMessageType::GetSinkCap)
+                            .await?;
+                        MessageType::Data(DataMessageType::SinkCapabilities)
+                    }
+                    PartnerQuery::DiscoverIdentity => {
+                        self.protocol_layer
+                            .transmit_discover_identity(self.partner_svdm_version)
+                            .await?;
+                        MessageType::Data(DataMessageType::VendorDefined)
+                    }
                     PartnerQuery::SourceCapabilitiesExtended => {
                         self.protocol_layer
                             .transmit_control_message(ControlMessageType::GetSourceCapExtended)
@@ -874,18 +893,67 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                     .protocol_layer
                     .receive_message_type(
                         &[answer, MessageType::Control(ControlMessageType::NotSupported)],
-                        TimerType::SenderResponse,
+                        if *query == PartnerQuery::DiscoverIdentity {
+                            TimerType::VDMResponse
+                        } else {
+                            TimerType::SenderResponse
+                        },
                     )
                     .await;
                 let outcome = match result {
                     Ok(message) => match message.payload {
                         None => QueryOutcome::NotSupported,
+                        Some(Payload::Data(Data::SinkCapabilities(caps))) => {
+                            let mut block = heapless::Vec::new();
+                            for pdo in caps.pdos() {
+                                block
+                                    .extend_from_slice(&pdo.to_raw().to_le_bytes())
+                                    .map_err(|_| ProtocolError::UnexpectedMessage)?;
+                            }
+                            QueryOutcome::Answer(block)
+                        }
+                        Some(Payload::Data(Data::VendorDefined((vdm, objects))))
+                            if objects.len() + 1 == message.header.num_objects() =>
+                        {
+                            let raw = u32::from(vdm);
+                            // Table 6.33: PD SID, Structured, SVDM 1.0/2.0/2.1, object position 0,
+                            // Discover Identity; reserved bit 5 is ignored.
+                            if raw >> 16 != 0xff00
+                                || raw & 0x8000 == 0
+                                || (raw >> 13) & 3 > 1
+                                || ((raw >> 13) & 3 == 1 && (raw >> 11) & 3 > 1)
+                                || (raw >> 8) & 7 != 0
+                                || raw & 0x1f != 1
+                            {
+                                return Err(ProtocolError::UnexpectedMessage.into());
+                            }
+                            // SVDM 1.0's minor field is reserved; normalize it away.
+                            let version = if (raw >> 13) & 3 == 0 { 0 } else { raw & 0x7800 };
+                            if version > self.partner_svdm_version {
+                                return Err(ProtocolError::UnexpectedMessage.into());
+                            }
+                            self.partner_svdm_version = version;
+                            match (raw >> 6) & 3 {
+                                1 if (3..=6).contains(&objects.len()) => {
+                                    let mut block = heapless::Vec::new();
+                                    for object in core::iter::once(raw).chain(objects) {
+                                        block
+                                            .extend_from_slice(&object.to_le_bytes())
+                                            .map_err(|_| ProtocolError::UnexpectedMessage)?;
+                                    }
+                                    QueryOutcome::Answer(block)
+                                }
+                                2 if objects.is_empty() => QueryOutcome::Nak,
+                                3 if objects.is_empty() => QueryOutcome::Busy,
+                                _ => return Err(ProtocolError::UnexpectedMessage.into()),
+                            }
+                        }
                         Some(Payload::Extended(extended::Extended::SourceCapabilitiesExtended(block))) => {
                             QueryOutcome::Answer(heapless::Vec::from_slice(&block).expect("25 <= 26"))
                         }
-                        Some(Payload::Extended(extended::Extended::ManufacturerInfo(block))) => {
-                            QueryOutcome::Answer(block)
-                        }
+                        Some(Payload::Extended(extended::Extended::ManufacturerInfo(block))) => QueryOutcome::Answer(
+                            heapless::Vec::from_slice(&block).map_err(|_| ProtocolError::UnexpectedMessage)?,
+                        ),
                         Some(Payload::Data(Data::Revision(rmdo))) => {
                             QueryOutcome::Answer(heapless::Vec::from_slice(&rmdo.to_le_bytes()).expect("4 <= 26"))
                         }

@@ -19,6 +19,17 @@ USB PD PHYs.
   - a specific fixed voltage and/or current, and
   - augmented PDOs (PPS or AVS).
 
+## Partner discovery
+
+The sink DPM can explicitly request `PartnerQuery::SinkCapabilities` or
+`PartnerQuery::DiscoverIdentity` from PD3 Ready without changing power or data
+role. Replies retain up to seven raw objects; identity includes its VDM header
+and only the VDOs actually received. NAK, BUSY, Not_Supported, deferral and
+timeout are separate outcomes, and the common SVDM version is retained until
+detach. Identity uses VDMResponseTimer anchored to the request's GoodCRC.
+Callers still own partner-role eligibility, voltage limits and physical safety;
+these queries do not provide a source power supply or role-swap support.
+
 ## Usage
 
 Find usage examples for different platforms and modes in the [GitHub repository](https://github.com/elagil/usbpd/tree/main/examples).
