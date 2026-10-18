@@ -8,8 +8,9 @@ use core::future::Future;
 /// SenderResponseTimer duration in milliseconds (USB PD R3.2 V1.2,
 /// section 7.31.2 and Table 7.9: 27-50 ms).
 pub const SENDER_RESPONSE_MS: u64 = 30;
-/// Selected tVDMSenderResponse in milliseconds (USB PD Table 7.9: 24–30 ms).
-pub const VDM_RESPONSE_MS: u64 = 27;
+/// Selected tVDMSenderResponse in milliseconds (USB PD R3.2 V1.2 Table 7.9:
+/// 24–50 ms): the maximum, for partners that answer VDMs from software.
+pub const VDM_RESPONSE_MS: u64 = 50;
 
 /// Receive Error.
 #[derive(Debug, Clone, Copy)]

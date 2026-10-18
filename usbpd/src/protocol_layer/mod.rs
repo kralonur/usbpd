@@ -785,7 +785,7 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
                 } else {
                     usbpd_traits::SENDER_RESPONSE_MS
                 };
-                TIMER::after_millis(duration.saturating_sub(elapsed)).await;
+                TIMER::after_timer(timer_type, duration.saturating_sub(elapsed)).await;
             } else {
                 Self::get_timer(timer_type).await;
             }
@@ -865,11 +865,9 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
         self.transmit(message).await
     }
 
-    /// Send one SOP Discover Identity request at the common SVDM version (Table 6.33).
-    pub async fn transmit_discover_identity(&mut self, version: u32) -> Result<(), ProtocolError> {
+    /// Send one SOP Structured VDM made of its VDM Header alone (Table 6.33).
+    pub async fn transmit_structured_vdm(&mut self, vdm: u32) -> Result<(), ProtocolError> {
         use message::data::vendor_defined::{VdmHeader, VdmHeaderStructured};
-        // USB-IF SID, Structured VDM, initiator command Discover Identity.
-        const DISCOVER_IDENTITY: u32 = 0xff00_8001;
         let header = Header::new_data(
             self.default_header,
             self.counters.tx_message,
@@ -878,10 +876,7 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
         );
         self.transmit(Message::new_with_data(
             header,
-            Data::VendorDefined((
-                VdmHeader::Structured(VdmHeaderStructured(DISCOVER_IDENTITY | version)),
-                heapless::Vec::new(),
-            )),
+            Data::VendorDefined((VdmHeader::Structured(VdmHeaderStructured(vdm)), heapless::Vec::new())),
         ))
         .await
     }

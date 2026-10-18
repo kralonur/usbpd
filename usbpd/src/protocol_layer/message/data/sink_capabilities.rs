@@ -318,7 +318,8 @@ impl SinkPowerDataObject {
     }
 }
 
-/// Decode a Sink PDO using its own layouts, not Source PDO flags (Tables 6.14–6.19).
+/// Decode a Sink PDO using its own layouts, not Source PDO flags (Tables 6.6, 6.7,
+/// 6.9–6.12, 6.14, 6.15 and 6.17).
 pub fn parse_raw_pdo(raw: u32) -> SinkPowerDataObject {
     match raw >> 30 {
         0 => SinkPowerDataObject::FixedSupply(FixedSupply(raw)),

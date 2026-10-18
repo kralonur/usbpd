@@ -26,7 +26,7 @@ The sink DPM can explicitly request `PartnerQuery::SinkCapabilities` or
 role. Replies retain up to seven raw objects; identity includes its VDM header
 and only the VDOs actually received. NAK, BUSY, Not_Supported, deferral and
 timeout are separate outcomes, and the common SVDM version is retained until
-detach. Identity uses VDMResponseTimer anchored to the request's GoodCRC.
+detach or Hard Reset. Identity uses VDMResponseTimer anchored to the request's GoodCRC.
 Callers still own partner-role eligibility, voltage limits and physical safety;
 these queries do not provide a source power supply or role-swap support.
 

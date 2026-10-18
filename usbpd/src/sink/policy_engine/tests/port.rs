@@ -116,3 +116,42 @@ async fn identity_rejects_wrong_command_and_missing_mandatory_vdos() {
         assert!(matches!(engine.state, State::SendSoftReset));
     }
 }
+
+// This sink initiates Discover Identity, so it must NAK Structured VDM requests
+// (Table 7.2), not claim no Structured VDM support with Not_Supported; the NAK
+// and its own later request use the received lower version (section 8.5.1). An
+// Invalid major 10b reads as 2.x (Table 6.33); reserved bit 5 is sent as zero.
+#[tokio::test]
+async fn structured_vdm_requests_are_nakked_at_the_common_version() {
+    for (request, nak) in [
+        (0xff00_8001u32, 0xff00_8081u32),
+        (0xff00_b001, 0xff00_a881),
+        (0xff00_c021, 0xff00_a081),
+    ] {
+        let mut engine = query_engine(PartnerQuery::DiscoverIdentity);
+        engine.device_policy_manager.ask.clear();
+        inject(&mut engine, source_header(15, 1, 1, false), &request.to_le_bytes());
+        engine.run_step().await.unwrap();
+        assert!(matches!(engine.state, State::SendVdmNak(_, sent) if sent == nak));
+        simulate_source_control_message(&mut engine, ControlMessageType::GoodCRC, 0);
+        engine.run_step().await.unwrap();
+        engine.protocol_layer.driver().probe_transmitted_data(); // GoodCRC
+        let frame = engine.protocol_layer.driver().probe_transmitted_data();
+        assert_eq!(frame[2..], nak.to_le_bytes());
+        engine.device_policy_manager.ask.push(PartnerQuery::DiscoverIdentity);
+        engine.run_step().await.unwrap();
+        simulate_source_control_message(&mut engine, ControlMessageType::GoodCRC, 1);
+        inject(&mut engine, source_header(15, 1, 2, false), &nak.to_le_bytes());
+        engine.run_step().await.unwrap();
+        let frame = engine.protocol_layer.driver().probe_transmitted_data();
+        assert_eq!(frame[2..], (0xff00_8001 | (nak & 0x7800)).to_le_bytes());
+    }
+    // Attention and stray responses: GoodCRC only. Unstructured: Not_Supported.
+    for (vdm, unsupported) in [(0xff01_a046u32, false), (0xff00_a041, false), (0x1234_0000, true)] {
+        let mut engine = ready_engine::<true>();
+        inject(&mut engine, source_header(15, 1, 1, false), &vdm.to_le_bytes());
+        engine.run_step().await.unwrap();
+        assert_eq!(matches!(engine.state, State::SendNotSupported(_)), unsupported);
+        assert_eq!(transmitted(&mut engine), [GOOD_CRC]);
+    }
+}

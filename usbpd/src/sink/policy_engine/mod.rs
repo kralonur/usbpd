@@ -57,6 +57,8 @@ enum State {
     /// which requires running SinkRequestTimer before allowing re-request.
     Ready(request::PowerSource, bool),
     SendNotSupported(request::PowerSource),
+    /// NAK a Structured VDM request: the reply's VDM Header (Table 7.2).
+    SendVdmNak(request::PowerSource, u32),
     /// PE_DRS_UFP_DFP_Reject_Swap or PE_VCS_Reject_VCONN_Swap: Reject a DR_Swap
     /// (UFP-only Sink) or a VCONN_Swap (this Sink is not the VCONN Source in Ready).
     RejectSwap(request::PowerSource),
@@ -92,8 +94,56 @@ enum State {
     EprKeepAlive(request::PowerSource),
 }
 
+// USB-IF SID, Structured VDM, initiator command Discover Identity (Table 6.33).
+const DISCOVER_IDENTITY: u32 = 0xff00_8001;
 // SVDM 2.1 encoded in VDM Header bits 14..11 (Table 6.33).
 const INITIAL_SVDM_VERSION: u32 = 0x2800;
+
+/// The SVDM version as VDM Header bits 14..11 (Table 6.33): SVDM 1.0 is 0, its
+/// minor field not defined; an Invalid major 10b/11b is read as 2.x.
+fn svdm_version(raw: u32) -> u32 {
+    if (raw >> 13) & 3 == 0 { 0 } else { 0x2000 | raw & 0x1800 }
+}
+
+/// The reply version for a received VDM Header: the received one, or this port's
+/// highest when it is higher (section 8.5.1).
+fn svdm_reply_version(raw: u32) -> u32 {
+    svdm_version(raw).min(INITIAL_SVDM_VERSION)
+}
+
+/// A Discover Identity response (Table 6.33): PD SID, Structured, command 1; ACK
+/// with the three mandatory VDOs, or NAK/BUSY alone. Object Position and reserved
+/// bit 5 are ignored. Its version may not exceed the request's (section 8.5.1), so
+/// an Invalid minor is rejected, and it becomes the common one. `None` if invalid.
+fn identity_outcome(raw: u32, objects: &[u32], common_version: &mut u32) -> Option<QueryOutcome> {
+    let version = svdm_version(raw);
+    if raw >> 16 != 0xff00 || raw & 0x8000 == 0 || raw & 0x1f != 1 || version > *common_version {
+        return None;
+    }
+    let outcome = match (raw >> 6) & 3 {
+        1 if (3..=6).contains(&objects.len()) => {
+            let mut block = heapless::Vec::new();
+            for object in core::iter::once(&raw).chain(objects) {
+                block.extend_from_slice(&object.to_le_bytes()).ok()?;
+            }
+            QueryOutcome::Answer(block)
+        }
+        2 if objects.is_empty() => QueryOutcome::Nak,
+        3 if objects.is_empty() => QueryOutcome::Busy,
+        _ => return None,
+    };
+    *common_version = version;
+    Some(outcome)
+}
+
+/// Table 7.2: a port supporting Structured VDMs NAKs a request it does not
+/// support, with the request's SVID (section 8.6). Bit 15 Structured, bits 7..6
+/// Command Type (00b REQ, 10b NAK); reserved bit 5 is sent as zero. An Attention
+/// (command 6) request is never answered (Table 8.1, section 8.6.6).
+fn svdm_nak(raw: u32) -> Option<u32> {
+    (raw & 0x8000 != 0 && (raw >> 6) & 3 == 0 && raw & 0x1f != 6)
+        .then(|| raw & !(0x7800 | 0x20) | svdm_reply_version(raw) | 0x80)
+}
 
 /// Implementation of the sink policy engine.
 /// See spec, [8.3.3.3]
@@ -117,7 +167,8 @@ pub struct Sink<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> {
     /// (PS_RDY, Reject or Wait). A further Protocol Error then means the Soft
     /// Reset did not correct the error: Hard Reset (section 7.1.1).
     recovering: bool,
-    // Highest common SOP SVDM version, retained until detach (section 6.4.4.2.3).
+    // Highest common SOP SVDM version, retained until Detach or Hard Reset
+    // (section 8.5.1).
     partner_svdm_version: u32,
 
     _timer: PhantomData<TIMER>,
@@ -618,6 +669,28 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                             MessageType::Data(DataMessageType::VendorDefined) if !pd3 => {
                                 State::Ready(*power_source, *after_wait)
                             }
+                            // Table 7.2: this port initiates Discover Identity, so it supports
+                            // Structured VDMs and NAKs their requests; Attention and responses
+                            // outside its own AMS get no reply. Unstructured: Not_Supported.
+                            MessageType::Data(DataMessageType::VendorDefined) => match &message.payload {
+                                Some(Payload::Data(Data::VendorDefined((vdm, _)))) => {
+                                    let raw = u32::from(*vdm);
+                                    match svdm_nak(raw) {
+                                        Some(nak) => {
+                                            // Section 8.5.1: Discover Identity received sets the
+                                            // common version too (PD SID, command 1).
+                                            if raw >> 16 == 0xff00 && raw & 0x1f == 1 {
+                                                self.partner_svdm_version =
+                                                    self.partner_svdm_version.min(svdm_reply_version(raw));
+                                            }
+                                            State::SendVdmNak(*power_source, nak)
+                                        }
+                                        None if raw & 0x8000 != 0 => State::Ready(*power_source, *after_wait),
+                                        None => State::SendNotSupported(*power_source),
+                                    }
+                                }
+                                _ => State::SendNotSupported(*power_source),
+                            },
                             // PE_SNK_Not_Supported_Received: inform the DPM, no response.
                             MessageType::Control(ControlMessageType::NotSupported) if pd3 => {
                                 State::Ready(*power_source, *after_wait)
@@ -848,7 +921,7 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                     }
                     PartnerQuery::DiscoverIdentity => {
                         self.protocol_layer
-                            .transmit_discover_identity(self.partner_svdm_version)
+                            .transmit_structured_vdm(DISCOVER_IDENTITY | self.partner_svdm_version)
                             .await?;
                         MessageType::Data(DataMessageType::VendorDefined)
                     }
@@ -915,38 +988,8 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                         Some(Payload::Data(Data::VendorDefined((vdm, objects))))
                             if objects.len() + 1 == message.header.num_objects() =>
                         {
-                            let raw = u32::from(vdm);
-                            // Table 6.33: PD SID, Structured, SVDM 1.0/2.0/2.1, object position 0,
-                            // Discover Identity; reserved bit 5 is ignored.
-                            if raw >> 16 != 0xff00
-                                || raw & 0x8000 == 0
-                                || (raw >> 13) & 3 > 1
-                                || ((raw >> 13) & 3 == 1 && (raw >> 11) & 3 > 1)
-                                || (raw >> 8) & 7 != 0
-                                || raw & 0x1f != 1
-                            {
-                                return Err(ProtocolError::UnexpectedMessage.into());
-                            }
-                            // SVDM 1.0's minor field is reserved; normalize it away.
-                            let version = if (raw >> 13) & 3 == 0 { 0 } else { raw & 0x7800 };
-                            if version > self.partner_svdm_version {
-                                return Err(ProtocolError::UnexpectedMessage.into());
-                            }
-                            self.partner_svdm_version = version;
-                            match (raw >> 6) & 3 {
-                                1 if (3..=6).contains(&objects.len()) => {
-                                    let mut block = heapless::Vec::new();
-                                    for object in core::iter::once(raw).chain(objects) {
-                                        block
-                                            .extend_from_slice(&object.to_le_bytes())
-                                            .map_err(|_| ProtocolError::UnexpectedMessage)?;
-                                    }
-                                    QueryOutcome::Answer(block)
-                                }
-                                2 if objects.is_empty() => QueryOutcome::Nak,
-                                3 if objects.is_empty() => QueryOutcome::Busy,
-                                _ => return Err(ProtocolError::UnexpectedMessage.into()),
-                            }
+                            identity_outcome(u32::from(vdm), &objects, &mut self.partner_svdm_version)
+                                .ok_or(ProtocolError::UnexpectedMessage)?
                         }
                         Some(Payload::Extended(extended::Extended::SourceCapabilitiesExtended(block))) => {
                             QueryOutcome::Answer(heapless::Vec::from_slice(&block).expect("25 <= 26"))
@@ -982,6 +1025,10 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
                 let (power_source, query) = (*power_source, *query);
                 self.device_policy_manager.query(query, outcome).await;
                 State::Ready(power_source, false)
+            }
+            State::SendVdmNak(power_source, nak) => {
+                self.protocol_layer.transmit_structured_vdm(*nak).await?;
+                State::Ready(*power_source, false)
             }
             State::SendNotSupported(power_source) => {
                 // PD2 V1.3 section 6.8.1 uses Reject; PD3 section 6.3.16
@@ -1105,6 +1152,9 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: DevicePolicyManager> Sink<DRIVER, TIMER,
 
                 // Reset EPR mode (per spec 6.8.3.2: "Hard Reset shall cause EPR Mode to be exited")
                 self.mode = Mode::Spr;
+
+                // The common SVDM version holds only until Hard Reset (section 8.5.1).
+                self.partner_svdm_version = INITIAL_SVDM_VERSION;
 
                 // Reset contract to default
                 self.contract = Contract::Safe5V;
